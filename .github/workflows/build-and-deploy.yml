@@ -6,27 +6,35 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Deploy to gh-pages
+      - name: Copy static assets into dist
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git checkout --orphan gh-pages
-          git rm -rf .
-          # Copy docs contents from main to working tree root
-          git checkout main -- docs/
-          # Move all files from docs/ to root (including dotfiles)
-          shopt -s dotglob
-          mv docs/* .
-          rmdir docs 2>/dev/null || true
-          git add .
-          git commit -m "Deploy from main: $(git rev-parse --short main)" || echo "No changes to commit"
-          git push -f origin gh-pages
+          mkdir -p dist
+          cp -r docs/* dist/ 2>/dev/null || true
+          cp docs/.nojekyll dist/ 2>/dev/null || true
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
