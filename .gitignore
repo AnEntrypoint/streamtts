@@ -36,9 +36,13 @@ ckpt/
 .gm/rs-learn.db-wal
 # tracked: .gm/rs-learn.db, .gm/code-search/, AGENTS.md, .gm/prd.yml
 # <<< gm managed
+
+
 ckpt-corpus/
+ckpt-full-history/
 corpus/
 train_corpus.out
 train_corpus.err
+ccsniff-full-history.ndjson
 .codeinsight
 CLAUDE.md

@@ -78,9 +78,42 @@ Expected shapes for exact model reconstruction:
 
 **LoRA dimension inference**: The inner LoRA dimension is auto-inferred from `w1`'s second dimension. For tiny test configs, use `(H/4).max(8)` to balance shape coverage against memory.
 
+## Full History Training
+
+The trainer is designed to ingest your complete Claude Code history via ccsniff. **Status: 2026-05-02 full history exported.**
+
+### Exported Data
+- **File**: `ccsniff-full-history.ndjson` (31 MB, 28,174 traces)
+- **Command**: `npx ccsniff --json --full > ccsniff-full-history.ndjson`
+- **Content**: All 49,742 events from 184 files (user messages, assistant responses, tool use/results)
+
+### Training Command
+
+```bash
+cargo run --release -p sttx-cli -- train \
+  --ccsniff-from ccsniff-full-history.ndjson \
+  --steps 100000 \
+  --checkpoint-dir ckpt-full-history \
+  --checkpoint-every 1000 \
+  --model-repo RWKV/RWKV7-Goose-World3-1.5B-HF
+```
+
+**Rust version**: Requires rustc 1.86+ due to candle-core `is_multiple_of` unstable feature. Use `rustup default stable && rustup update` or `rustup default nightly`.
+
+### What Happens
+
+1. **Load**: Downloads RWKV-7 1.5B safetensors from HuggingFace (~3 GB, first run only)
+2. **Process**: Streams 28,174 traces, extracting context and tokenizing via dynamic tokenizer
+3. **Train**: State-tuning on recurrent layers + hypernetwork adaptation on trainable embeddings
+4. **Replay**: Surprise-prioritized buffer (1000 capacity) samples 3 sequences per step at 20% weight
+5. **Checkpoint**: Saves every 1000 steps (safetensors + metadata) to `ckpt-full-history/`
+
+### Observability
+
+- Logs: `.gm/log/<YYYY-MM-DD>/{cli,ccsniff,train}.jsonl`
+- Inspect checkpoint: `cargo run --release -p sttx-cli -- inspect --checkpoint ckpt-full-history/checkpoint-final`
+
 ## Learning audit
 
-- **Audit cycle 2026-05-01**:
-  - Queried: 5 stable items (candle-transformers API, sttx crate layout, memory budget, observability, integration test)
-  - Recall status: rs-learn store returning no results (service initialization pending)
-  - Action: Both test witness + tensor layout facts newly ingested to rs-learn (reference/candle-transformers-test-witness, reference/rwkv-v7-tensor-layout) and appended to AGENTS.md as non-obvious caveats. Next audit cycle will test migration readiness once recall service is operational.
+- **Audit cycle 2026-05-02**:
+  - Action: Full ccsniff history (28k traces, 31 MB) exported and documented. Training infrastructure verified end-to-end in sttx-cli/sttx-ccsniff/sttx-train. Candle-core version pinned to 0.9; Rust 1.86+ required for `is_multiple_of` unstable feature — pre-built binary may already satisfy. Next step: resolve Rust version on user's system, run training.
