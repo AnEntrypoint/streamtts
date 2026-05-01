@@ -6,23 +6,24 @@ on:
   workflow_dispatch:
 
 permissions:
-  pages: write
-  id-token: write
+  contents: write
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/upload-pages-artifact@v3
         with:
-          path: 'docs'
-      - uses: actions/configure-pages@v4
-      - id: deployment
-        uses: actions/deploy-pages@v3
+          fetch-depth: 0
+      - name: Deploy to gh-pages
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan gh-pages
+          git rm -rf .
+          git checkout main -- docs
+          mv docs/* .
+          rmdir docs 2>/dev/null || true
+          git add .
+          git commit -m "Deploy from main: $(git rev-parse --short main)" || echo "No changes to commit"
+          git push -f origin gh-pages
