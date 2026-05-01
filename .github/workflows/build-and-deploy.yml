@@ -23,10 +23,9 @@ jobs:
           git rm -rf .
           # Copy docs contents from main to working tree root
           git checkout main -- docs/
-          # Move all files from docs/ to root
-          for f in docs/*; do
-            [ -e "$f" ] && mv "$f" .
-          done
+          # Move all files from docs/ to root (including dotfiles)
+          shopt -s dotglob
+          mv docs/* .
           rmdir docs 2>/dev/null || true
           git add .
           git commit -m "Deploy from main: $(git rev-parse --short main)" || echo "No changes to commit"
