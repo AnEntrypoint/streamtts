@@ -1,0 +1,44 @@
+/target
+**/*.rs.bck
+Cargo.lock.bak
+.gm/log/
+.gm/lastskill
+.gm/rs-learn.db
+.gm/rs-learn.db-*
+.gm/*.json
+.gm/imported-claude-md-*.md
+**/.gm/log/
+sample.ndjson
+sample-abs.ndjson
+ckpt/
+*.safetensors
+*.bin
+.vscode/
+.idea/
+.plugkit-browser-profile/
+.plugkit-browser-profile-*/
+.plugkit-agent-worktree/
+*.stackdump
+# >>> gm managed (do not edit between markers)
+.gm-stop-verified
+.gm/prd-state.json
+.gm/rslearn-counter.json
+.gm/git-block-counter.json
+.gm/learning-state.md
+.gm/trajectory-drafts/
+.gm/ingest-drafts/
+.gm/needs-gm
+.gm/lastskill
+.gm/turn-state.json
+.gm/no-memorize-this-turn
+.gm/prd.paused.yml
+.gm/rs-learn.db-shm
+.gm/rs-learn.db-wal
+# tracked: .gm/rs-learn.db, .gm/code-search/, AGENTS.md, .gm/prd.yml
+# <<< gm managed
+ckpt-corpus/
+corpus/
+train_corpus.out
+train_corpus.err
+.codeinsight
+CLAUDE.md
