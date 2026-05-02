@@ -1,28 +1,6 @@
-- id: upgrade-candle-transformers-to-main
-  subject: Upgrade candle-transformers to origin/main for rwkv_v7 support
-  status: pending
-  description: |
-    candle-transformers 0.9.x does not export rwkv_v7 module. Module exists in origin/main with fixed VarBuilder API and no unsigned_is_multiple_of usage. Upstream issue resolution: merge rwkv_v7.rs from origin/main into local candle-transformers, add pub mod rwkv_v7 to models/mod.rs, and test compilation. This also eliminates the E0658 unsigned_is_multiple_of blocker since origin/main's candle-core no longer uses the unstable feature.
-  effort: small
-  category: infra
-  route_family: grounding
-  load: 0.95
-  failure_modes:
-    - rwkv_v7.rs has other API incompatibilities beyond get_unchecked
-    - candle-core in origin/main has unrelated breaking changes
-  route_fit: examined
-  authorization: witnessed
-  blocking: [resume-rwkv-training]
-  blockedBy: []
-  acceptance:
-    - cargo check -p sttx-train succeeds without E0658 or E0432 errors
-    - candle_transformers::models::rwkv_v7::{Config, Model, State} are importable
-  edge_cases:
-    - get_unchecked may require VarBuilder::from_mmaped_safetensors in specific code paths
-
 - id: resume-rwkv-training
   subject: Resume RWKV-7 training with ccsniff full history
-  status: pending
+  status: in_progress
   description: |
     Once candle-transformers compiles with rwkv_v7 support, run witness test (synthetic safetensors, 2 steps) then full training on ccsniff-full-history.ndjson (28k traces, 100k steps, checkpoint every 1k). Verify: model load, tokenizer init, training step succeeds, checkpoint save round-trip, observability logs to .gm/log/.
   effort: large
