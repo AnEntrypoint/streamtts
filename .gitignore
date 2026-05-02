@@ -49,3 +49,4 @@ train_corpus.err
 ccsniff-full-history.ndjson
 .codeinsight
 CLAUDE.md
+/train*.log

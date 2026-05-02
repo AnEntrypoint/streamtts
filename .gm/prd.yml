@@ -15,12 +15,19 @@
   route_fit: examined
   authorization: weak_prior
   blocking: []
-  blockedBy: [upgrade-candle-transformers-to-main]
+  blockedBy: []
   acceptance:
     - witness test completes (synthetic safetensors, 2 steps)
     - cargo run --release completes 100k steps without panic
     - checkpoint-final exists with valid metadata
     - .gm/log/train.jsonl has >=1000 lines
+  continuation: |
+    Training restarted 2026-05-02T04:35 with cleared HF cache.
+    Model download: PID 1989, ~2.9G of 3GB cached, ETA ~3 min.
+    First step: ETA ~5 min after model load.
+    100k steps: ETA ~4–6 hours total.
+    Monitor: wc -l .gm/log/2026-05-02/train.jsonl (target >=1000).
+    Post-completion: status→completed, delete .gm/prd.yml, commit & push.
   edge_cases:
     - ccsniff-full-history.ndjson missing (re-export if needed)
     - GPU OOM mid-training (fallback to CPU via --cpu flag)
