@@ -61,6 +61,7 @@ impl CcsniffStream {
                                         Trace::AssistantMessage{..}=>1,
                                         Trace::ToolUse{..}=>2,
                                         Trace::ToolResult{..}=>3,
+                                        Trace::Pair{..}=>5,
                                         Trace::Other{..}=>4
                                     }}),
                                 );
@@ -94,23 +95,36 @@ impl CcsniffStream {
     }
 
     pub async fn from_file(path: &str, channel_capacity: usize) -> Result<Self> {
-        eprintln!("[ccsniff] reading file: {}", path);
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("read {path}"))?;
-        eprintln!("[ccsniff] file read, {} lines total", content.lines().count());
-        let mut traces = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<serde_json::Value>(line) {
-                Ok(v) => {
-                    let trace = Trace::from_ccsniff_event(v);
-                    traces.push(trace);
+        Self::from_files(&[path], channel_capacity, false).await
+    }
+
+    pub async fn from_files_paired(paths: &[&str], channel_capacity: usize) -> Result<Self> {
+        Self::from_files(paths, channel_capacity, true).await
+    }
+
+    pub async fn from_files(paths: &[&str], channel_capacity: usize, pair_mode: bool) -> Result<Self> {
+        let mut raw_events: Vec<serde_json::Value> = Vec::new();
+        for path in paths {
+            eprintln!("[ccsniff] reading file: {}", path);
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("read {path}"))?;
+            let line_count = content.lines().count();
+            eprintln!("[ccsniff] file read, {} lines total", line_count);
+            for line in content.lines() {
+                if line.trim().is_empty() { continue; }
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(v) => raw_events.push(v),
+                    Err(e) => eprintln!("[ccsniff] parse error: {}", e),
                 }
-                Err(e) => eprintln!("[ccsniff] parse error: {}", e),
             }
         }
+
+        let traces = if pair_mode {
+            build_pairs(raw_events)
+        } else {
+            raw_events.into_iter().map(Trace::from_ccsniff_event).collect()
+        };
+
         eprintln!("[ccsniff] parsed {} traces", traces.len());
         let (tx, rx) = mpsc::channel(channel_capacity);
         tokio::spawn(async move {
@@ -133,6 +147,36 @@ impl CcsniffStream {
     pub async fn recv(&mut self) -> Option<Trace> {
         self.rx.recv().await
     }
+}
+
+fn build_pairs(events: Vec<serde_json::Value>) -> Vec<Trace> {
+    let mut out = Vec::with_capacity(events.len() / 2);
+    let mut i = 0;
+    while i < events.len() {
+        let ev = &events[i];
+        if Trace::is_prompt_role(ev) {
+            let prompt_text = {
+                let t = Trace::from_ccsniff_event(ev.clone());
+                let s = t.corpus_text();
+                if s.is_empty() { i += 1; continue; }
+                s
+            };
+            if i + 1 < events.len() && Trace::is_completion_for(ev, &events[i + 1]) {
+                let completion_text = {
+                    let t = Trace::from_ccsniff_event(events[i + 1].clone());
+                    t.corpus_text()
+                };
+                if !completion_text.is_empty() {
+                    out.push(Trace::Pair { prompt: prompt_text, completion: completion_text });
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(Trace::from_ccsniff_event(ev.clone()));
+        }
+        i += 1;
+    }
+    out
 }
 
 async fn ensure_ccsniff_installed() -> Result<()> {

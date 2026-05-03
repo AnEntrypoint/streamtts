@@ -7,6 +7,7 @@ pub enum Trace {
     AssistantMessage { text: String },
     ToolUse { name: String, input: serde_json::Value },
     ToolResult { name: String, output: String },
+    Pair { prompt: String, completion: String },
     Other { raw: serde_json::Value },
 }
 
@@ -53,7 +54,32 @@ impl Trace {
             Trace::ToolResult { name, output } => {
                 format!("<tool_result name={name}>{output}</tool_result>")
             }
+            Trace::Pair { prompt, completion } => {
+                format!("<human>{prompt}</human>\n<bot>{completion}</bot>")
+            }
             Trace::Other { raw } => raw.to_string(),
+        }
+    }
+
+    pub fn is_prompt_role(v: &serde_json::Value) -> bool {
+        let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let typ = v.get("type").and_then(|r| r.as_str()).unwrap_or("");
+        let is_meta = v.get("isMeta").and_then(|x| x.as_bool()).unwrap_or(false);
+        if is_meta { return false; }
+        matches!((role, typ), ("user", "text") | ("assistant", "tool_use"))
+    }
+
+    pub fn is_completion_for(prompt: &serde_json::Value, candidate: &serde_json::Value) -> bool {
+        let p_role = prompt.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let p_typ = prompt.get("type").and_then(|r| r.as_str()).unwrap_or("");
+        let c_role = candidate.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let c_typ = candidate.get("type").and_then(|r| r.as_str()).unwrap_or("");
+        let c_meta = candidate.get("isMeta").and_then(|x| x.as_bool()).unwrap_or(false);
+        if c_meta { return false; }
+        match (p_role, p_typ, c_role, c_typ) {
+            ("user", "text", "assistant", "text") => true,
+            ("assistant", "tool_use", "tool_result", "tool_result") => true,
+            _ => false,
         }
     }
 }

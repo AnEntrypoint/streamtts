@@ -25,8 +25,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Train {
-        #[arg(long)]
-        ccsniff_from: String,
+        #[arg(long, num_args = 1..)]
+        ccsniff_from: Vec<String>,
         #[arg(long, default_value_t = 1000)]
         steps: u64,
         #[arg(long, default_value = "ckpt")]
@@ -37,6 +37,8 @@ enum Cmd {
         model_repo: String,
         #[arg(long, default_value_t = false)]
         cpu: bool,
+        #[arg(long, default_value_t = false)]
+        api_pairs: bool,
     },
     Inspect {
         #[arg(long)]
@@ -61,24 +63,26 @@ async fn main() -> Result<()> {
             checkpoint_every,
             model_repo,
             cpu,
-        } => run_train(ccsniff_from, steps, checkpoint_dir, checkpoint_every, model_repo, cpu).await,
+            api_pairs,
+        } => run_train(ccsniff_from, steps, checkpoint_dir, checkpoint_every, model_repo, cpu, api_pairs).await,
         Cmd::Inspect { checkpoint } => run_inspect(checkpoint),
         Cmd::MergeStats { checkpoint, top } => run_merge_stats(checkpoint, top),
     }
 }
 
 async fn run_train(
-    ccsniff_from: String,
+    ccsniff_from: Vec<String>,
     steps: u64,
     checkpoint_dir: PathBuf,
     checkpoint_every: u64,
     repo: String,
     cpu: bool,
+    api_pairs: bool,
 ) -> Result<()> {
     let device = Device::Cpu;
     let dtype = DType::F32;
     eprintln!("[cli] device init complete");
-    obs::info("cli", json!({"event":"train_start","repo": repo,"steps": steps,"device_cuda": device.is_cuda()}));
+    obs::info("cli", json!({"event":"train_start","repo": repo,"steps": steps,"api_pairs": api_pairs}));
 
     eprintln!("[cli] about to load model from {}", repo);
     let model = model::load(&repo, device, dtype).await?;
@@ -93,10 +97,15 @@ async fn run_train(
     let mut trainer = Trainer::new(model, cfg)?;
     eprintln!("[cli] trainer created successfully");
 
-    eprintln!("[cli] about to open ccsniff stream from {}", ccsniff_from);
-    let mut stream = match ccsniff_from.as_str() {
-        "live" => CcsniffStream::live(64).await?,
-        path => CcsniffStream::from_file(path, 64).await?,
+    let sources: Vec<&str> = ccsniff_from.iter().map(String::as_str).collect();
+    let source_desc = sources.join(", ");
+    eprintln!("[cli] about to open ccsniff stream from {} (api_pairs={})", source_desc, api_pairs);
+    let mut stream = if sources == ["live"] {
+        CcsniffStream::live(64).await?
+    } else if api_pairs {
+        CcsniffStream::from_files_paired(&sources, 64).await?
+    } else {
+        CcsniffStream::from_files(&sources, 64, false).await?
     };
     eprintln!("[cli] stream opened successfully");
 
