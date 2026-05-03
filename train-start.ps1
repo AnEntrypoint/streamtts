@@ -10,6 +10,7 @@ param(
 
 $pidFile = ".\train.pid"
 $logFile = ".\train.log"
+$errFile = ".\train.err"
 
 if (Test-Path $pidFile) {
     $existingPid = Get-Content $pidFile -Raw
@@ -39,7 +40,7 @@ $args = @(
 $proc = Start-Process -FilePath $Binary `
     -ArgumentList $args `
     -RedirectStandardOutput $logFile `
-    -RedirectStandardError $logFile `
+    -RedirectStandardError $errFile `
     -NoNewWindow `
     -PassThru
 

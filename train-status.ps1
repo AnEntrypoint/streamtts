@@ -21,3 +21,10 @@ if (Test-Path $logFile) {
     Write-Host "--- Last $Lines lines of $logFile ---"
     Get-Content $logFile -Tail $Lines
 }
+
+$errFile = ".\train.err"
+if ((Test-Path $errFile) -and (Get-Item $errFile).Length -gt 0) {
+    Write-Host ""
+    Write-Host "--- Last $Lines lines of $errFile ---"
+    Get-Content $errFile -Tail $Lines
+}

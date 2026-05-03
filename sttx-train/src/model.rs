@@ -112,7 +112,188 @@ async fn load_from_hf(repo: &hf_hub::api::tokio::ApiRepo, repo_id: &str) -> Resu
     let config_json: Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
     let config = config_from_hf_json(&config_json)?;
 
+    // If the first weight file uses HF naming (model.layers.*), remap to native RWKV (blocks.*).
+    let weights_paths = maybe_remap_hf_weights(&weights_paths, &config)?;
+
     Ok((config, tokenizer_path, weights_paths))
+}
+
+/// Detect HF-format safetensors (model.layers.* keys) and rewrite to native RWKV format
+/// (blocks.* keys) expected by candle-transformers rwkv_v7. The remapped file is cached
+/// alongside the original with a `.rwkv-native.safetensors` suffix.
+fn maybe_remap_hf_weights(paths: &[PathBuf], config: &Config) -> Result<Vec<PathBuf>> {
+    use safetensors::{tensor::TensorView, SafeTensors};
+    if paths.is_empty() {
+        return Ok(paths.to_vec());
+    }
+    let first_bytes = std::fs::read(&paths[0])?;
+    let first_st = SafeTensors::deserialize(&first_bytes).context("parse first safetensors")?;
+    // Detect HF format by presence of "model.embeddings.weight"
+    if !first_st.names().contains(&"model.embeddings.weight") {
+        return Ok(paths.to_vec());
+    }
+
+    let out_path = paths[0].with_extension("rwkv-native.safetensors");
+    if out_path.exists() {
+        eprintln!("[model] using cached remapped weights at {}", out_path.display());
+        return Ok(vec![out_path]);
+    }
+
+    eprintln!("[model] HF key format detected — remapping to native RWKV format (this runs once)");
+
+    let mut all_bytes: Vec<Vec<u8>> = Vec::new();
+    for p in paths {
+        all_bytes.push(std::fs::read(p)?);
+    }
+    let sts: Vec<SafeTensors> = all_bytes.iter()
+        .map(|b| SafeTensors::deserialize(b).context("parse shard"))
+        .collect::<Result<_>>()?;
+
+    // Each entry: (native_name, data_bytes, dtype, shape)
+    let mut remapped: Vec<(String, Vec<u8>, safetensors::Dtype, Vec<usize>)> = Vec::new();
+
+    let get = |name: &str| -> Option<(Vec<u8>, safetensors::Dtype, Vec<usize>)> {
+        for st in &sts {
+            if let Ok(tv) = st.tensor(name) {
+                return Some((tv.data().to_vec(), tv.dtype(), tv.shape().to_vec()));
+            }
+        }
+        None
+    };
+
+    // Transpose a row-major 2D matrix stored as bytes (element_bytes = dtype size).
+    let transpose2d = |data: Vec<u8>, rows: usize, cols: usize, elem: usize| -> Vec<u8> {
+        let mut out = vec![0u8; data.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                let src = (r * cols + c) * elem;
+                let dst = (c * rows + r) * elem;
+                out[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
+            }
+        }
+        out
+    };
+
+    // Reshape [H] → [1, 1, H] (same bytes, different shape metadata).
+    let reshape_1h = |data: Vec<u8>, h: usize| -> (Vec<u8>, Vec<usize>) {
+        (data, vec![1, 1, h])
+    };
+
+    let mut push = |native: &str, hf: &str| {
+        if let Some((data, dtype, shape)) = get(hf) {
+            remapped.push((native.to_string(), data, dtype, shape));
+        }
+    };
+
+    let mut push_reshape = |native: &str, hf: &str| {
+        if let Some((data, dtype, shape)) = get(hf) {
+            let h = shape[0];
+            let (data2, shape2) = reshape_1h(data, h);
+            remapped.push((native.to_string(), data2, dtype, shape2));
+        }
+    };
+
+    // lora.0 is [lora_dim, H] in HF, needs [H, lora_dim] for candle (w1/a1/v1/g1)
+    let mut push_lora0 = |native: &str, hf: &str| {
+        if let Some((data, dtype, shape)) = get(hf) {
+            let elem = safetensors_dtype_size(dtype);
+            let (lora_dim, h) = (shape[0], shape[1]);
+            let data2 = transpose2d(data, lora_dim, h, elem);
+            remapped.push((native.to_string(), data2, dtype, vec![h, lora_dim]));
+        }
+    };
+
+    // lora.2.weight is [H, lora_dim] in HF, needs [lora_dim, H] for candle (w2/a2/v2/g2)
+    let mut push_lora2w = |native: &str, hf: &str| {
+        if let Some((data, dtype, shape)) = get(hf) {
+            let elem = safetensors_dtype_size(dtype);
+            let (h, lora_dim) = (shape[0], shape[1]);
+            let data2 = transpose2d(data, h, lora_dim, elem);
+            remapped.push((native.to_string(), data2, dtype, vec![lora_dim, h]));
+        }
+    };
+
+    push("emb.weight", "model.embeddings.weight");
+    push("ln_out.weight", "model.norm.weight");
+    push("ln_out.bias", "model.norm.bias");
+    push("head.weight", "lm_head.weight");
+
+    for i in 0..config.num_hidden_layers {
+        let hpfx = format!("model.layers.{i}");
+        let npfx = format!("blocks.{i}");
+
+        if i == 0 {
+            push(&format!("{npfx}.ln0.weight"), &format!("{hpfx}.pre_norm.weight"));
+            push(&format!("{npfx}.ln0.bias"), &format!("{hpfx}.pre_norm.bias"));
+        }
+        push(&format!("{npfx}.ln1.weight"), &format!("{hpfx}.attn_norm.weight"));
+        push(&format!("{npfx}.ln1.bias"), &format!("{hpfx}.attn_norm.bias"));
+        push(&format!("{npfx}.ln2.weight"), &format!("{hpfx}.ffn_norm.weight"));
+        push(&format!("{npfx}.ln2.bias"), &format!("{hpfx}.ffn_norm.bias"));
+
+        let ha = format!("{hpfx}.attn");
+        let na = format!("{npfx}.att");
+        // x_* are already [1, 1, H]
+        for tok in ["x_r", "x_w", "x_k", "x_v", "x_a", "x_g"] {
+            push(&format!("{na}.{tok}"), &format!("{ha}.{tok}"));
+        }
+        // LoRA weights need transpose; biases need reshape [H] → [1,1,H]
+        push_lora0(&format!("{na}.w1"), &format!("{ha}.w_lora.lora.0.weight"));
+        push_lora2w(&format!("{na}.w2"), &format!("{ha}.w_lora.lora.2.weight"));
+        push_reshape(&format!("{na}.w0"), &format!("{ha}.w_lora.lora.2.bias"));
+        push_lora0(&format!("{na}.a1"), &format!("{ha}.a_lora.lora.0.weight"));
+        push_lora2w(&format!("{na}.a2"), &format!("{ha}.a_lora.lora.2.weight"));
+        push_reshape(&format!("{na}.a0"), &format!("{ha}.a_lora.lora.2.bias"));
+        push_lora0(&format!("{na}.v1"), &format!("{ha}.v_lora.lora.0.weight"));
+        push_lora2w(&format!("{na}.v2"), &format!("{ha}.v_lora.lora.2.weight"));
+        push_reshape(&format!("{na}.v0"), &format!("{ha}.v_lora.lora.2.bias"));
+        push_lora0(&format!("{na}.g1"), &format!("{ha}.g_lora.lora.0.weight"));
+        push_lora2w(&format!("{na}.g2"), &format!("{ha}.g_lora.lora.2.weight"));
+        // k_k, k_a are [H] → need [1,1,H]
+        push_reshape(&format!("{na}.k_k"), &format!("{ha}.k_k"));
+        push_reshape(&format!("{na}.k_a"), &format!("{ha}.k_a"));
+        push(&format!("{na}.r_k"), &format!("{ha}.r_k"));
+        push(&format!("{na}.receptance.weight"), &format!("{ha}.r_proj.weight"));
+        push(&format!("{na}.key.weight"), &format!("{ha}.k_proj.weight"));
+        push(&format!("{na}.value.weight"), &format!("{ha}.v_proj.weight"));
+        push(&format!("{na}.output.weight"), &format!("{ha}.o_proj.weight"));
+        push(&format!("{na}.ln_x.weight"), &format!("{ha}.g_norm.weight"));
+        push(&format!("{na}.ln_x.bias"), &format!("{ha}.g_norm.bias"));
+
+        let hf = format!("{hpfx}.ffn");
+        let nf = format!("{npfx}.ffn");
+        // ffn.x_k is [H] → need [1,1,H]
+        push_reshape(&format!("{nf}.x_k"), &format!("{hf}.x_k"));
+        push(&format!("{nf}.key.weight"), &format!("{hf}.key.weight"));
+        push(&format!("{nf}.value.weight"), &format!("{hf}.value.weight"));
+    }
+
+    let views: Vec<(String, TensorView)> = remapped.iter()
+        .map(|(name, data, dtype, shape)| {
+            let tv = TensorView::new(*dtype, shape.clone(), data).expect("tensor view");
+            (name.clone(), tv)
+        })
+        .collect();
+    let view_refs: Vec<(&str, &TensorView)> = views.iter()
+        .map(|(n, t)| (n.as_str(), t))
+        .collect();
+    safetensors::serialize_to_file(view_refs, &None, &out_path)
+        .context("write remapped safetensors")?;
+    eprintln!("[model] remapped weights written to {}", out_path.display());
+
+    Ok(vec![out_path])
+}
+
+fn safetensors_dtype_size(dtype: safetensors::Dtype) -> usize {
+    match dtype {
+        safetensors::Dtype::F32 => 4,
+        safetensors::Dtype::F16 | safetensors::Dtype::BF16 => 2,
+        safetensors::Dtype::F64 | safetensors::Dtype::I64 | safetensors::Dtype::U64 => 8,
+        safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
+        safetensors::Dtype::I16 | safetensors::Dtype::U16 => 2,
+        safetensors::Dtype::I8 | safetensors::Dtype::U8 | safetensors::Dtype::BOOL => 1,
+        _ => 2,
+    }
 }
 
 async fn load_tiny_synthetic(device: &Device, dtype: DType, start: Instant) -> Result<LoadedModel> {
