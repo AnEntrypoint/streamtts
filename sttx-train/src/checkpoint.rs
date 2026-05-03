@@ -36,11 +36,43 @@ pub fn load_meta(dir: &Path) -> Result<CheckpointMeta> {
 }
 
 pub fn load_into(dir: &Path, varmap: &mut VarMap) -> Result<()> {
-    let weights = dir.join("trainable.safetensors");
-    varmap.load(&weights).context("load varmap")?;
+    use candle_core::Tensor;
+    use safetensors::SafeTensors;
+    let weights_path = dir.join("trainable.safetensors");
+    let mmap_bytes = std::fs::read(&weights_path)
+        .with_context(|| format!("read {}", weights_path.display()))?;
+    let st = SafeTensors::deserialize(&mmap_bytes).context("parse safetensors")?;
+    let data = varmap.data().lock().unwrap();
+    let mut loaded = 0usize;
+    let mut skipped = 0usize;
+    for (name, var) in data.iter() {
+        match st.tensor(name) {
+            Ok(view) => {
+                let dtype = var.dtype();
+                let shape: Vec<usize> = view.shape().to_vec();
+                let t = Tensor::from_raw_buffer(
+                    view.data(),
+                    candle_core::DType::F32,
+                    &shape,
+                    var.device(),
+                )
+                .and_then(|t| t.to_dtype(dtype))
+                .with_context(|| format!("load tensor {name}"))?;
+                var.set(&t).with_context(|| format!("set var {name}"))?;
+                loaded += 1;
+            }
+            Err(_) => {
+                skipped += 1;
+                obs::info(
+                    "checkpoint",
+                    json!({"event":"key_missing","key": name,"action":"skip_init_kept"}),
+                );
+            }
+        }
+    }
     obs::info(
         "checkpoint",
-        json!({"event":"loaded","dir": dir.display().to_string()}),
+        json!({"event":"loaded","dir": dir.display().to_string(),"loaded": loaded,"skipped": skipped}),
     );
     Ok(())
 }
