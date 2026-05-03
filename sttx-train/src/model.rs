@@ -64,12 +64,24 @@ pub async fn load(repo_id: &str, device: Device, dtype: DType) -> Result<LoadedM
             Ok(LoadedModel { model, config, tokenizer, device, dtype })
         },
         Ok(Err(e)) => {
-            obs::info("model", json!({"event":"hf_download_fallback","reason": e.to_string()}));
-            load_tiny_synthetic(&device, dtype, start).await
+            let msg = format!(
+                "Model weights for '{repo_id}' are not available locally and the download failed: {e}\n\
+                 Run this once to download the model (~3 GB):\n\
+                 \n  huggingface-cli download {repo_id}\n\
+                 \nOr set HF_HUB_OFFLINE=1 and ensure weights are cached."
+            );
+            obs::info("model", json!({"event":"hf_download_failed","reason": e.to_string()}));
+            anyhow::bail!("{msg}")
         },
         Err(_) => {
+            let msg = format!(
+                "Model weights for '{repo_id}' could not be loaded within 30s.\n\
+                 The weights are likely not fully cached locally.\n\
+                 Run this once to download the model (~3 GB):\n\
+                 \n  huggingface-cli download {repo_id}\n"
+            );
             obs::info("model", json!({"event":"hf_download_timeout"}));
-            load_tiny_synthetic(&device, dtype, start).await
+            anyhow::bail!("{msg}")
         }
     }
 }
