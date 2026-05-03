@@ -179,93 +179,94 @@ fn maybe_remap_hf_weights(paths: &[PathBuf], config: &Config) -> Result<Vec<Path
         (data, vec![1, 1, h])
     };
 
-    let mut push = |native: &str, hf: &str| {
-        if let Some((data, dtype, shape)) = get(hf) {
-            remapped.push((native.to_string(), data, dtype, shape));
-        }
-    };
-
-    let mut push_reshape = |native: &str, hf: &str| {
-        if let Some((data, dtype, shape)) = get(hf) {
-            let h = shape[0];
-            let (data2, shape2) = reshape_1h(data, h);
-            remapped.push((native.to_string(), data2, dtype, shape2));
-        }
-    };
-
+    macro_rules! push {
+        ($native:expr, $hf:expr) => {
+            if let Some((data, dtype, shape)) = get($hf) {
+                remapped.push(($native.to_string(), data, dtype, shape));
+            }
+        };
+    }
+    macro_rules! push_reshape {
+        ($native:expr, $hf:expr) => {
+            if let Some((data, dtype, shape)) = get($hf) {
+                let h = shape[0];
+                let (data2, shape2) = reshape_1h(data, h);
+                remapped.push(($native.to_string(), data2, dtype, shape2));
+            }
+        };
+    }
     // lora.0 is [lora_dim, H] in HF, needs [H, lora_dim] for candle (w1/a1/v1/g1)
-    let mut push_lora0 = |native: &str, hf: &str| {
-        if let Some((data, dtype, shape)) = get(hf) {
-            let elem = safetensors_dtype_size(dtype);
-            let (lora_dim, h) = (shape[0], shape[1]);
-            let data2 = transpose2d(data, lora_dim, h, elem);
-            remapped.push((native.to_string(), data2, dtype, vec![h, lora_dim]));
-        }
-    };
-
+    macro_rules! push_lora0 {
+        ($native:expr, $hf:expr) => {
+            if let Some((data, dtype, shape)) = get($hf) {
+                let elem = safetensors_dtype_size(dtype);
+                let (lora_dim, h) = (shape[0], shape[1]);
+                let data2 = transpose2d(data, lora_dim, h, elem);
+                remapped.push(($native.to_string(), data2, dtype, vec![h, lora_dim]));
+            }
+        };
+    }
     // lora.2.weight is [H, lora_dim] in HF, needs [lora_dim, H] for candle (w2/a2/v2/g2)
-    let mut push_lora2w = |native: &str, hf: &str| {
-        if let Some((data, dtype, shape)) = get(hf) {
-            let elem = safetensors_dtype_size(dtype);
-            let (h, lora_dim) = (shape[0], shape[1]);
-            let data2 = transpose2d(data, h, lora_dim, elem);
-            remapped.push((native.to_string(), data2, dtype, vec![lora_dim, h]));
-        }
-    };
+    macro_rules! push_lora2w {
+        ($native:expr, $hf:expr) => {
+            if let Some((data, dtype, shape)) = get($hf) {
+                let elem = safetensors_dtype_size(dtype);
+                let (h, lora_dim) = (shape[0], shape[1]);
+                let data2 = transpose2d(data, h, lora_dim, elem);
+                remapped.push(($native.to_string(), data2, dtype, vec![lora_dim, h]));
+            }
+        };
+    }
 
-    push("emb.weight", "model.embeddings.weight");
-    push("ln_out.weight", "model.norm.weight");
-    push("ln_out.bias", "model.norm.bias");
-    push("head.weight", "lm_head.weight");
+    push!("emb.weight", "model.embeddings.weight");
+    push!("ln_out.weight", "model.norm.weight");
+    push!("ln_out.bias", "model.norm.bias");
+    push!("head.weight", "lm_head.weight");
 
     for i in 0..config.num_hidden_layers {
         let hpfx = format!("model.layers.{i}");
         let npfx = format!("blocks.{i}");
 
         if i == 0 {
-            push(&format!("{npfx}.ln0.weight"), &format!("{hpfx}.pre_norm.weight"));
-            push(&format!("{npfx}.ln0.bias"), &format!("{hpfx}.pre_norm.bias"));
+            push!(&format!("{npfx}.ln0.weight"), &format!("{hpfx}.pre_norm.weight"));
+            push!(&format!("{npfx}.ln0.bias"), &format!("{hpfx}.pre_norm.bias"));
         }
-        push(&format!("{npfx}.ln1.weight"), &format!("{hpfx}.attn_norm.weight"));
-        push(&format!("{npfx}.ln1.bias"), &format!("{hpfx}.attn_norm.bias"));
-        push(&format!("{npfx}.ln2.weight"), &format!("{hpfx}.ffn_norm.weight"));
-        push(&format!("{npfx}.ln2.bias"), &format!("{hpfx}.ffn_norm.bias"));
+        push!(&format!("{npfx}.ln1.weight"), &format!("{hpfx}.attn_norm.weight"));
+        push!(&format!("{npfx}.ln1.bias"), &format!("{hpfx}.attn_norm.bias"));
+        push!(&format!("{npfx}.ln2.weight"), &format!("{hpfx}.ffn_norm.weight"));
+        push!(&format!("{npfx}.ln2.bias"), &format!("{hpfx}.ffn_norm.bias"));
 
         let ha = format!("{hpfx}.attn");
         let na = format!("{npfx}.att");
-        // x_* are already [1, 1, H]
         for tok in ["x_r", "x_w", "x_k", "x_v", "x_a", "x_g"] {
-            push(&format!("{na}.{tok}"), &format!("{ha}.{tok}"));
+            push!(&format!("{na}.{tok}"), &format!("{ha}.{tok}"));
         }
-        // LoRA weights need transpose; biases need reshape [H] → [1,1,H]
-        push_lora0(&format!("{na}.w1"), &format!("{ha}.w_lora.lora.0.weight"));
-        push_lora2w(&format!("{na}.w2"), &format!("{ha}.w_lora.lora.2.weight"));
-        push_reshape(&format!("{na}.w0"), &format!("{ha}.w_lora.lora.2.bias"));
-        push_lora0(&format!("{na}.a1"), &format!("{ha}.a_lora.lora.0.weight"));
-        push_lora2w(&format!("{na}.a2"), &format!("{ha}.a_lora.lora.2.weight"));
-        push_reshape(&format!("{na}.a0"), &format!("{ha}.a_lora.lora.2.bias"));
-        push_lora0(&format!("{na}.v1"), &format!("{ha}.v_lora.lora.0.weight"));
-        push_lora2w(&format!("{na}.v2"), &format!("{ha}.v_lora.lora.2.weight"));
-        push_reshape(&format!("{na}.v0"), &format!("{ha}.v_lora.lora.2.bias"));
-        push_lora0(&format!("{na}.g1"), &format!("{ha}.g_lora.lora.0.weight"));
-        push_lora2w(&format!("{na}.g2"), &format!("{ha}.g_lora.lora.2.weight"));
-        // k_k, k_a are [H] → need [1,1,H]
-        push_reshape(&format!("{na}.k_k"), &format!("{ha}.k_k"));
-        push_reshape(&format!("{na}.k_a"), &format!("{ha}.k_a"));
-        push(&format!("{na}.r_k"), &format!("{ha}.r_k"));
-        push(&format!("{na}.receptance.weight"), &format!("{ha}.r_proj.weight"));
-        push(&format!("{na}.key.weight"), &format!("{ha}.k_proj.weight"));
-        push(&format!("{na}.value.weight"), &format!("{ha}.v_proj.weight"));
-        push(&format!("{na}.output.weight"), &format!("{ha}.o_proj.weight"));
-        push(&format!("{na}.ln_x.weight"), &format!("{ha}.g_norm.weight"));
-        push(&format!("{na}.ln_x.bias"), &format!("{ha}.g_norm.bias"));
+        push_lora0!(&format!("{na}.w1"), &format!("{ha}.w_lora.lora.0.weight"));
+        push_lora2w!(&format!("{na}.w2"), &format!("{ha}.w_lora.lora.2.weight"));
+        push_reshape!(&format!("{na}.w0"), &format!("{ha}.w_lora.lora.2.bias"));
+        push_lora0!(&format!("{na}.a1"), &format!("{ha}.a_lora.lora.0.weight"));
+        push_lora2w!(&format!("{na}.a2"), &format!("{ha}.a_lora.lora.2.weight"));
+        push_reshape!(&format!("{na}.a0"), &format!("{ha}.a_lora.lora.2.bias"));
+        push_lora0!(&format!("{na}.v1"), &format!("{ha}.v_lora.lora.0.weight"));
+        push_lora2w!(&format!("{na}.v2"), &format!("{ha}.v_lora.lora.2.weight"));
+        push_reshape!(&format!("{na}.v0"), &format!("{ha}.v_lora.lora.2.bias"));
+        push_lora0!(&format!("{na}.g1"), &format!("{ha}.g_lora.lora.0.weight"));
+        push_lora2w!(&format!("{na}.g2"), &format!("{ha}.g_lora.lora.2.weight"));
+        push_reshape!(&format!("{na}.k_k"), &format!("{ha}.k_k"));
+        push_reshape!(&format!("{na}.k_a"), &format!("{ha}.k_a"));
+        push!(&format!("{na}.r_k"), &format!("{ha}.r_k"));
+        push!(&format!("{na}.receptance.weight"), &format!("{ha}.r_proj.weight"));
+        push!(&format!("{na}.key.weight"), &format!("{ha}.k_proj.weight"));
+        push!(&format!("{na}.value.weight"), &format!("{ha}.v_proj.weight"));
+        push!(&format!("{na}.output.weight"), &format!("{ha}.o_proj.weight"));
+        push!(&format!("{na}.ln_x.weight"), &format!("{ha}.g_norm.weight"));
+        push!(&format!("{na}.ln_x.bias"), &format!("{ha}.g_norm.bias"));
 
         let hf = format!("{hpfx}.ffn");
         let nf = format!("{npfx}.ffn");
-        // ffn.x_k is [H] → need [1,1,H]
-        push_reshape(&format!("{nf}.x_k"), &format!("{hf}.x_k"));
-        push(&format!("{nf}.key.weight"), &format!("{hf}.key.weight"));
-        push(&format!("{nf}.value.weight"), &format!("{hf}.value.weight"));
+        push_reshape!(&format!("{nf}.x_k"), &format!("{hf}.x_k"));
+        push!(&format!("{nf}.key.weight"), &format!("{hf}.key.weight"));
+        push!(&format!("{nf}.value.weight"), &format!("{hf}.value.weight"));
     }
 
     let views: Vec<(String, TensorView)> = remapped.iter()
