@@ -216,6 +216,10 @@ impl Trainer {
     }
 }
 
+pub fn build_state_prefix_pub(cfg: &Config, vm: &VarMap, dev: &Device, dtype: DType) -> Result<Vec<Tensor>> {
+    build_state_prefix(cfg, vm, dev, dtype)
+}
+
 fn build_state_prefix(cfg: &Config, vm: &VarMap, dev: &Device, dtype: DType) -> Result<Vec<Tensor>> {
     let n_heads = cfg.hidden_size / cfg.head_size;
     let shape = (n_heads, cfg.head_size, cfg.head_size);

@@ -9,13 +9,14 @@ use sttx_ccsniff::CcsniffStream;
 use sttx_core::obs;
 use sttx_train::checkpoint::{self, CheckpointMeta};
 use sttx_train::model::{self, DEFAULT_MODEL_REPO};
+use sttx_train::serve;
 use sttx_train::train::{TrainConfig, Trainer};
 
 #[derive(Parser)]
 #[command(
     name = "streamtts",
     version,
-    about = "RWKV-7 streaming trainer with online dynamic tokenization and surprise replay"
+    about = "RWKV-7 streaming trainer and inference server"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,6 +40,14 @@ enum Cmd {
         cpu: bool,
         #[arg(long, default_value_t = false)]
         api_pairs: bool,
+    },
+    Serve {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        #[arg(long, default_value_t = 200)]
+        max_tokens: usize,
     },
     Inspect {
         #[arg(long)]
@@ -65,6 +74,9 @@ async fn main() -> Result<()> {
             cpu,
             api_pairs,
         } => run_train(ccsniff_from, steps, checkpoint_dir, checkpoint_every, model_repo, cpu, api_pairs).await,
+        Cmd::Serve { checkpoint, port, max_tokens } => {
+            serve::run(checkpoint, port, max_tokens).await
+        }
         Cmd::Inspect { checkpoint } => run_inspect(checkpoint),
         Cmd::MergeStats { checkpoint, top } => run_merge_stats(checkpoint, top),
     }

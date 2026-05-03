@@ -41,12 +41,14 @@ ckpt/
 
 
 
-ckpt-corpus/
-ckpt-full-history/
+
+ckpt-*/
 corpus/
 train_corpus.out
 train_corpus.err
 ccsniff-full-history.ndjson
+ccsniff-export.err
 .codeinsight
 CLAUDE.md
-/train*.log
+*.log
+vendor/
