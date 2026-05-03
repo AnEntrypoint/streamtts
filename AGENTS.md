@@ -113,6 +113,14 @@ cargo run --release -p sttx-cli -- train \
 - Logs: `.gm/log/<YYYY-MM-DD>/{cli,ccsniff,train}.jsonl`
 - Inspect checkpoint: `cargo run --release -p sttx-cli -- inspect --checkpoint ckpt-full-history/checkpoint-final`
 
+## Training dtype caveat
+
+`forward_loss` must **not** call `.to_dtype(...)` on `target_t`. Doing so causes a dtype mismatch at the loss computation step that surfaces only at runtime on real traces, not on synthetic tensors. Removing that cast was the root-cause fix that unblocked training (verified 2026-05-03: 100 steps clean, no dtype errors).
+
+## ccsniff export size is session-scoped
+
+`npx ccsniff --json --full` only exports traces from the current Claude Code session history available at the time of export. The 2026-05-02 export (28k traces / 31 MB) is not reproducible; the 2026-05-03 re-export yielded 2485 traces / 3.1 MB. Do not treat any single export as a stable corpus — re-export before each training run if freshness matters.
+
 ## Learning audit
 
 - **Audit cycle 2026-05-02**:
