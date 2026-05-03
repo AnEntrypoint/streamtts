@@ -269,6 +269,23 @@ fn maybe_remap_hf_weights(paths: &[PathBuf], config: &Config) -> Result<Vec<Path
         push!(&format!("{nf}.value.weight"), &format!("{hf}.value.weight"));
     }
 
+    // Layer 0 has no v_lora in the HF model, but candle's rwkv_v7 calls get_unchecked("v1")
+    // on every layer to infer lora dim. Inject zero tensors shaped like layer 1's v_lora.
+    for (name, src) in [
+        ("blocks.0.att.v1", "blocks.1.att.v1"),
+        ("blocks.0.att.v2", "blocks.1.att.v2"),
+        ("blocks.0.att.v0", "blocks.1.att.v0"),
+    ] {
+        if !remapped.iter().any(|(n, _, _, _)| n == name) {
+            let found = remapped.iter().find(|(n, _, _, _)| n == src)
+                .map(|(_, _, dtype, shape)| (*dtype, shape.clone()));
+            if let Some((dtype, shape)) = found {
+                let zeros = vec![0u8; shape.iter().product::<usize>() * safetensors_dtype_size(dtype)];
+                remapped.push((name.to_string(), zeros, dtype, shape));
+            }
+        }
+    }
+
     let views: Vec<(String, TensorView)> = remapped.iter()
         .map(|(name, data, dtype, shape)| {
             let tv = TensorView::new(*dtype, shape.clone(), data).expect("tensor view");
