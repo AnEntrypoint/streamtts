@@ -129,7 +129,7 @@ fn maybe_remap_hf_weights(paths: &[PathBuf], config: &Config) -> Result<Vec<Path
     let first_bytes = std::fs::read(&paths[0])?;
     let first_st = SafeTensors::deserialize(&first_bytes).context("parse first safetensors")?;
     // Detect HF format by presence of "model.embeddings.weight"
-    if !first_st.names().contains(&"model.embeddings.weight") {
+    if !first_st.names().iter().any(|n| *n == "model.embeddings.weight") {
         return Ok(paths.to_vec());
     }
 
