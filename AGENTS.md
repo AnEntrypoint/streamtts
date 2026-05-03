@@ -113,6 +113,10 @@ cargo run --release -p sttx-cli -- train \
 - Logs: `.gm/log/<YYYY-MM-DD>/{cli,ccsniff,train}.jsonl`
 - Inspect checkpoint: `cargo run --release -p sttx-cli -- inspect --checkpoint ckpt-full-history/checkpoint-final`
 
+## Plugkit long-process limitation
+
+The plugkit runner (exec:bash, exec:nodejs, PowerShell tool) cannot sustain processes that run longer than ~2 minutes. Background tasks fail silently with empty output files; foreground PowerShell also fails silently for long-running tasks. This affects `cargo build --release` (~3 min) and HF model downloads (~10 min+). For any such task, instruct the user to run the command manually in their terminal — do not attempt to run it via any plugkit exec method.
+
 ## Training dtype caveat
 
 `forward_loss` must **not** call `.to_dtype(...)` on `target_t`. Doing so causes a dtype mismatch at the loss computation step that surfaces only at runtime on real traces, not on synthetic tensors. Removing that cast was the root-cause fix that unblocked training (verified 2026-05-03: 100 steps clean, no dtype errors).
