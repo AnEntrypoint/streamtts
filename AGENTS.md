@@ -131,6 +131,10 @@ The base RWKV-7 model is loaded from mmaped safetensors as frozen constants — 
 
 **Fix**: Added a trainable per-vocab affine adapter (`logit_adapter.scale` init=1, `logit_adapter.bias` init=0) applied to the frozen logits before CE loss. These are registered in the `VarMap` (checkpoint save/load is automatic) and sit directly in the gradient path. LR raised to `3e-4`.
 
+## HF vs native RWKV key format (2026-05-03)
+
+`RWKV/RWKV7-Goose-World3-1.5B-HF` uses HuggingFace-style tensor names (`model.layers.N.attn.*`) but candle-transformers `rwkv_v7::Model` expects native RWKV names (`blocks.N.att.*`). `sttx-train/src/model.rs::maybe_remap_hf_weights()` detects this on load, remaps all keys, transposes LoRA weight matrices (lora.0 `[lora_dim, H]` → `[H, lora_dim]`, lora.2 `[H, lora_dim]` → `[lora_dim, H]`), and reshapes 1D `[H]` vectors to `[1,1,H]` for `k_k`, `k_a`, `ffn.x_k`, and LoRA bias terms. The result is cached as `model.safetensors.rwkv-native.safetensors` in the HF cache — rebuilt only if absent.
+
 ## ccsniff live mode uses local dev binary
 
 `CcsniffStream::live()` checks for `C:/dev/ccsniff/src/cli.js` first and runs `node C:/dev/ccsniff/src/cli.js` if present. Falls back to `npx ccsniff` if not found.
