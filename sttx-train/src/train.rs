@@ -199,8 +199,19 @@ impl Trainer {
         for (layer_idx, prefix) in self.state_prefix.iter().enumerate() {
             state.per_layer[layer_idx].att_kv = prefix.clone();
         }
-        let logits = self.model.model.forward_seq(input, &mut state)?;
-        let target_t = Tensor::new(targets, &self.model.device)?;
+        let logits_raw = self.model.model.forward_seq(input, &mut state)?;
+        let (logits, target_t) = match logits_raw.rank() {
+            1 => (
+                logits_raw.unsqueeze(0)?,
+                Tensor::new(&[*targets.last().unwrap()], &self.model.device)?,
+            ),
+            2 => (logits_raw, Tensor::new(targets, &self.model.device)?),
+            3 => {
+                let (_, s, v) = logits_raw.dims3()?;
+                (logits_raw.reshape((s, v))?, Tensor::new(targets, &self.model.device)?)
+            }
+            _ => (logits_raw, Tensor::new(targets, &self.model.device)?),
+        };
         let loss = candle_nn::loss::cross_entropy(&logits, &target_t)?;
         Ok(loss)
     }
