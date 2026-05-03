@@ -25,15 +25,24 @@ impl Drop for KillOnDrop {
 
 impl CcsniffStream {
     pub async fn live(channel_capacity: usize) -> Result<Self> {
-        ensure_ccsniff_installed().await?;
-        let cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
-        let mut child = Command::new(cmd)
-            .args(["--yes", "ccsniff", "-f", "--json", "--full"])
+        let ccsniff_dev = std::path::Path::new("C:/dev/ccsniff/src/cli.js");
+        let (prog, args): (&str, Vec<&str>) = if ccsniff_dev.exists() {
+            ("node", vec!["C:/dev/ccsniff/src/cli.js", "-f", "--json", "--full"])
+        } else {
+            ensure_ccsniff_installed().await?;
+            if cfg!(windows) {
+                ("npx.cmd", vec!["--yes", "ccsniff", "-f", "--json", "--full"])
+            } else {
+                ("npx", vec!["--yes", "ccsniff", "-f", "--json", "--full"])
+            }
+        };
+        let mut child = Command::new(prog)
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("spawn {cmd} ccsniff failed"))?;
+            .with_context(|| format!("spawn {prog} ccsniff failed"))?;
 
         let stdout = child
             .stdout
@@ -181,9 +190,16 @@ fn build_pairs(events: Vec<serde_json::Value>) -> Vec<Trace> {
 
 async fn ensure_ccsniff_installed() -> Result<()> {
     let start = Instant::now();
-    let cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let ccsniff_dev = std::path::Path::new("C:/dev/ccsniff/src/cli.js");
+    let (cmd, args): (&str, Vec<&str>) = if ccsniff_dev.exists() {
+        ("node", vec!["C:/dev/ccsniff/src/cli.js", "--list-projects"])
+    } else if cfg!(windows) {
+        ("npx.cmd", vec!["--yes", "ccsniff", "--list-projects"])
+    } else {
+        ("npx", vec!["--yes", "ccsniff", "--list-projects"])
+    };
     let out = Command::new(cmd)
-        .args(["--yes", "ccsniff", "--list-projects"])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

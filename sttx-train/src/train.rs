@@ -36,7 +36,7 @@ impl Default for TrainConfig {
             replay_capacity: 1000,
             replay_per_step: 3,
             replay_weight: 0.2,
-            lr: 1e-4,
+            lr: 3e-4,
             checkpoint_dir: PathBuf::from("ckpt"),
             checkpoint_every: 100,
             seed: 42,
@@ -49,6 +49,8 @@ pub struct Trainer {
     pub trainable: VarMap,
     pub hyper: Hypernetwork,
     pub state_prefix: Vec<Tensor>,
+    pub logit_scale: Tensor,
+    pub logit_bias: Tensor,
     pub dyn_tk: DynamicTokenizer,
     pub optimizer: AdamW,
     pub replay: ReplayBuffer,
@@ -65,6 +67,17 @@ impl Trainer {
         let hyper = Hypernetwork::new(model.config.hidden_size, vb.pp("hypernet"))?;
 
         let state_prefix = build_state_prefix(&model.config, &trainable, &model.device, model.dtype)?;
+
+        // Trainable logit adapter: scale (init 1) and bias (init 0) on top of frozen logits.
+        // These sit directly in the CE loss gradient path, enabling real parameter updates.
+        // Registered in the VarMap so checkpoint save/load works automatically.
+        let vocab = model.config.vocab_size;
+        let logit_scale = trainable.get(
+            (vocab,), "logit_adapter.scale", candle_nn::Init::Const(1.0), model.dtype, &model.device,
+        )?;
+        let logit_bias = trainable.get(
+            (vocab,), "logit_adapter.bias", candle_nn::Init::Const(0.0), model.dtype, &model.device,
+        )?;
 
         let optimizer = AdamW::new(
             trainable.all_vars(),
@@ -83,6 +96,8 @@ impl Trainer {
             trainable,
             hyper,
             state_prefix,
+            logit_scale,
+            logit_bias,
             dyn_tk,
             optimizer,
             replay,
@@ -200,7 +215,7 @@ impl Trainer {
             state.per_layer[layer_idx].att_kv = prefix.clone();
         }
         let logits_raw = self.model.model.forward_seq(input, &mut state)?;
-        let (logits, target_t) = match logits_raw.rank() {
+        let (logits_frozen, target_t) = match logits_raw.rank() {
             1 => (
                 logits_raw.unsqueeze(0)?,
                 Tensor::new(&[*targets.last().unwrap()], &self.model.device)?,
@@ -212,6 +227,8 @@ impl Trainer {
             }
             _ => (logits_raw, Tensor::new(targets, &self.model.device)?),
         };
+        // Apply trainable per-vocab affine adapter: logits = scale * frozen_logits + bias
+        let logits = logits_frozen.broadcast_mul(&self.logit_scale)?.broadcast_add(&self.logit_bias)?;
         let loss = candle_nn::loss::cross_entropy(&logits, &target_t)?;
         Ok(loss)
     }

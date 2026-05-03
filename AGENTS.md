@@ -125,6 +125,16 @@ The plugkit runner (exec:bash, exec:nodejs, PowerShell tool) cannot sustain proc
 
 `npx ccsniff --json --full` only exports traces from the current Claude Code session history available at the time of export. The 2026-05-02 export (28k traces / 31 MB) is not reproducible; the 2026-05-03 re-export yielded 2485 traces / 3.1 MB. Do not treat any single export as a stable corpus — re-export before each training run if freshness matters.
 
+## Flat loss root cause and fix (2026-05-03)
+
+The base RWKV-7 model is loaded from mmaped safetensors as frozen constants — candle has no `Var`s for it. The `state_prefix` tensors are injected into `state.per_layer[i].att_kv`, but RWKV's recurrent state is mutated in-place during `forward_seq`, so gradients do not flow back into the initial state in a way that affects the CE loss. Result: 2485 steps with loss stuck at ~12.454 — zero learning.
+
+**Fix**: Added a trainable per-vocab affine adapter (`logit_adapter.scale` init=1, `logit_adapter.bias` init=0) applied to the frozen logits before CE loss. These are registered in the `VarMap` (checkpoint save/load is automatic) and sit directly in the gradient path. LR raised to `3e-4`.
+
+## ccsniff live mode uses local dev binary
+
+`CcsniffStream::live()` checks for `C:/dev/ccsniff/src/cli.js` first and runs `node C:/dev/ccsniff/src/cli.js` if present. Falls back to `npx ccsniff` if not found.
+
 ## Learning audit
 
 - **Audit cycle 2026-05-02**:
