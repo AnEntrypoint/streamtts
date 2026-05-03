@@ -194,14 +194,14 @@ impl Trainer {
 
     pub fn forward_loss(&self, token_ids: &[u32]) -> Result<Tensor> {
         let input = &token_ids[..token_ids.len() - 1];
-        let target = token_ids[token_ids.len() - 1];
+        let targets = &token_ids[1..];
         let mut state = fresh_state(&self.model.config, &self.model.device, self.model.dtype)?;
         for (layer_idx, prefix) in self.state_prefix.iter().enumerate() {
             state.per_layer[layer_idx].att_kv = prefix.clone();
         }
         let logits = self.model.model.forward_seq(input, &mut state)?;
-        let target_t = Tensor::new(&[target], &self.model.device)?;
-        let loss = candle_nn::loss::cross_entropy(&logits.unsqueeze(0)?, &target_t)?;
+        let target_t = Tensor::new(targets, &self.model.device)?;
+        let loss = candle_nn::loss::cross_entropy(&logits, &target_t)?;
         Ok(loss)
     }
 

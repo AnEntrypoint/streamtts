@@ -59,6 +59,20 @@ enum Cmd {
         #[arg(long, default_value_t = 25)]
         top: usize,
     },
+    ValidateData {
+        #[arg(long, num_args = 1..)]
+        ccsniff_from: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        api_pairs: bool,
+    },
+    QualityAssert {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        steps: u64,
+        #[arg(long, default_value = DEFAULT_MODEL_REPO)]
+        model_repo: String,
+    },
 }
 
 #[tokio::main]
@@ -79,6 +93,8 @@ async fn main() -> Result<()> {
         }
         Cmd::Inspect { checkpoint } => run_inspect(checkpoint),
         Cmd::MergeStats { checkpoint, top } => run_merge_stats(checkpoint, top),
+        Cmd::ValidateData { ccsniff_from, api_pairs } => run_validate_data(ccsniff_from, api_pairs).await,
+        Cmd::QualityAssert { checkpoint, steps, model_repo } => run_quality_assert(checkpoint, steps, model_repo).await,
     }
 }
 
@@ -88,7 +104,7 @@ async fn run_train(
     checkpoint_dir: PathBuf,
     checkpoint_every: u64,
     repo: String,
-    cpu: bool,
+    _cpu: bool,
     api_pairs: bool,
 ) -> Result<()> {
     let device = Device::Cpu;
@@ -170,5 +186,60 @@ fn run_merge_stats(checkpoint: PathBuf, top: usize) -> Result<()> {
             "note": "per-pair stats are observed live; rerun training with --top-merges to dump pairs"
         })
     );
+    Ok(())
+}
+
+async fn run_validate_data(ccsniff_from: Vec<String>, api_pairs: bool) -> Result<()> {
+    let sources: Vec<&str> = ccsniff_from.iter().map(String::as_str).collect();
+    let mut stream = if api_pairs {
+        CcsniffStream::from_files_paired(&sources, 64).await?
+    } else {
+        CcsniffStream::from_files(&sources, 64, false).await?
+    };
+    let mut count = 0u64;
+    let mut non_empty = 0u64;
+    while let Some(trace) = stream.recv().await {
+        count += 1;
+        if !trace.corpus_text().is_empty() {
+            non_empty += 1;
+        }
+    }
+    println!("{}", json!({
+        "sources": ccsniff_from,
+        "api_pairs": api_pairs,
+        "traces_total": count,
+        "traces_non_empty": non_empty,
+    }));
+    Ok(())
+}
+
+async fn run_quality_assert(checkpoint: PathBuf, steps: u64, model_repo: String) -> Result<()> {
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+    let meta = checkpoint::load_meta(&checkpoint)?;
+    eprintln!("[quality] checkpoint steps={} recent_loss_mean={:.4}",
+        meta.steps,
+        meta.recent_loss.iter().copied().sum::<f32>() / meta.recent_loss.len().max(1) as f32
+    );
+    let model = model::load(&model_repo, device, dtype).await?;
+    let cfg = TrainConfig { steps, checkpoint_every: steps + 1, ..Default::default() };
+    let mut trainer = Trainer::new(model, cfg)?;
+    checkpoint::load_into(&checkpoint, &mut trainer.trainable)?;
+    let probe = "Hello, how can I help you today? I can assist with coding, writing, analysis, and more.";
+    let base_ids = sttx_train::tokens::encode_text(&trainer.model.tokenizer, probe)?;
+    let loss_before = trainer.forward_loss(&base_ids)?.to_dtype(DType::F32)?.to_vec0::<f32>()?;
+    let mut loss_after = loss_before;
+    for _ in 0..steps {
+        loss_after = trainer.step_on_ids(&base_ids)?;
+    }
+    let mean_saved = meta.recent_loss.iter().copied().sum::<f32>() / meta.recent_loss.len().max(1) as f32;
+    println!("{}", json!({
+        "checkpoint": checkpoint.display().to_string(),
+        "saved_mean_loss": mean_saved,
+        "loss_before_probe_steps": loss_before,
+        "loss_after_probe_steps": loss_after,
+        "probe_steps": steps,
+        "assessment": if loss_after < loss_before { "improving" } else { "not_improving" },
+    }));
     Ok(())
 }

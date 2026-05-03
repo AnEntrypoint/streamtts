@@ -41,16 +41,13 @@ pub async fn load(repo_id: &str, device: Device, dtype: DType) -> Result<LoadedM
     });
 
     match hf_timeout {
-        Ok(Ok((config, tokenizer_path))) => {
-            eprintln!("[model] config + tokenizer loaded, building model");
+        Ok(Ok((config, tokenizer_path, weights_paths))) => {
+            eprintln!("[model] config + tokenizer + weights loaded, building model");
             let tokenizer = Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
 
             let vb = unsafe {
-                let mut tmp = std::env::temp_dir();
-                tmp.push("sttx-real.safetensors");
-                write_random_safetensors(&config, &tmp, 42)?;
-                VarBuilder::from_mmaped_safetensors(&[tmp], dtype, &device)?
+                VarBuilder::from_mmaped_safetensors(&weights_paths, dtype, &device)?
             };
             let model = Model::new(&config, vb)?;
 
@@ -77,7 +74,7 @@ pub async fn load(repo_id: &str, device: Device, dtype: DType) -> Result<LoadedM
     }
 }
 
-async fn load_from_hf(repo: &hf_hub::api::tokio::ApiRepo, repo_id: &str) -> Result<(Config, PathBuf)> {
+async fn load_from_hf(repo: &hf_hub::api::tokio::ApiRepo, repo_id: &str) -> Result<(Config, PathBuf, Vec<PathBuf>)> {
     let config_path = repo
         .get("config.json")
         .await
@@ -98,12 +95,12 @@ async fn load_from_hf(repo: &hf_hub::api::tokio::ApiRepo, repo_id: &str) -> Resu
                 })?
         }
     };
-    let _weights_paths = list_safetensors(repo).await?;
+    let weights_paths = list_safetensors(repo).await?;
 
     let config_json: Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
     let config = config_from_hf_json(&config_json)?;
 
-    Ok((config, tokenizer_path))
+    Ok((config, tokenizer_path, weights_paths))
 }
 
 async fn load_tiny_synthetic(device: &Device, dtype: DType, start: Instant) -> Result<LoadedModel> {
