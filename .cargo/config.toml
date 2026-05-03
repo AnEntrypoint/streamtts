@@ -2,3 +2,6 @@
 opt-level = 3
 codegen-units = 1
 lto = "thin"
+
+[target.x86_64-pc-windows-msvc]
+linker = "link.exe"
