@@ -94,29 +94,39 @@ impl CcsniffStream {
     }
 
     pub async fn from_file(path: &str, channel_capacity: usize) -> Result<Self> {
-        let content = tokio::fs::read_to_string(path)
-            .await
+        eprintln!("[ccsniff] reading file: {}", path);
+        let content = std::fs::read_to_string(path)
             .with_context(|| format!("read {path}"))?;
+        eprintln!("[ccsniff] file read, {} lines total", content.lines().count());
+        let mut traces = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => {
+                    let trace = Trace::from_ccsniff_event(v);
+                    traces.push(trace);
+                }
+                Err(e) => eprintln!("[ccsniff] parse error: {}", e),
+            }
+        }
+        eprintln!("[ccsniff] parsed {} traces", traces.len());
         let (tx, rx) = mpsc::channel(channel_capacity);
         tokio::spawn(async move {
-            for line in content.lines() {
-                if line.trim().is_empty() {
-                    continue;
+            eprintln!("[ccsniff] spawned task started, sending {} traces", traces.len());
+            for (i, trace) in traces.into_iter().enumerate() {
+                if (i + 1) % 10 == 0 {
+                    eprintln!("[ccsniff] sent {} traces", i + 1);
                 }
-                match serde_json::from_str::<serde_json::Value>(line) {
-                    Ok(v) => {
-                        let trace = Trace::from_ccsniff_event(v);
-                        if tx.send(trace).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => obs::warn(
-                        "ccsniff",
-                        json!({"event":"file_parse_error","err": e.to_string()}),
-                    ),
+                if tx.send(trace).await.is_err() {
+                    eprintln!("[ccsniff] consumer dropped after {} traces", i + 1);
+                    break;
                 }
             }
+            eprintln!("[ccsniff] task complete, all traces sent");
         });
+        eprintln!("[ccsniff] returning stream");
         Ok(Self { rx, _child: None })
     }
 

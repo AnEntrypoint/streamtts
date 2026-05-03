@@ -6,6 +6,9 @@ members = [
     "sttx-train",
     "sttx-cli",
 ]
+exclude = [
+    "vendor-patches",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,7 +21,7 @@ repository = "https://github.com/AnEntrypoint/streamtts"
 candle-core = "0.10"
 candle-nn = "0.10"
 candle-transformers = "0.10"
-hf-hub = { version = "0.4", features = ["tokio"] }
+hf-hub = { version = "0.4", default-features = false, features = ["tokio"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,12 +33,11 @@ chrono = { version = "0.4", features = ["serde"] }
 lru = "0.12"
 rand = "0.8"
 
-[patch.crates-io]
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
-candle-transformers = { path = "../candle/candle-transformers" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+
+[patch.crates-io]
+candle-core = { path = "vendor-patches/candle-core-patched" }

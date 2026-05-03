@@ -64,7 +64,7 @@ impl Trainer {
         let vb = VarBuilder::from_varmap(&trainable, model.dtype, &model.device);
         let hyper = Hypernetwork::new(model.config.hidden_size, vb.pp("hypernet"))?;
 
-        let state_prefix = build_state_prefix(&model.config, &trainable, &model.device)?;
+        let state_prefix = build_state_prefix(&model.config, &trainable, &model.device, model.dtype)?;
 
         let optimizer = AdamW::new(
             trainable.all_vars(),
@@ -195,7 +195,7 @@ impl Trainer {
     pub fn forward_loss(&self, token_ids: &[u32]) -> Result<Tensor> {
         let input = &token_ids[..token_ids.len() - 1];
         let target = token_ids[token_ids.len() - 1];
-        let mut state = fresh_state(&self.model.config, &self.model.device)?;
+        let mut state = fresh_state(&self.model.config, &self.model.device, self.model.dtype)?;
         for (layer_idx, prefix) in self.state_prefix.iter().enumerate() {
             state.per_layer[layer_idx].att_kv = prefix.clone();
         }
@@ -216,7 +216,7 @@ impl Trainer {
     }
 }
 
-fn build_state_prefix(cfg: &Config, vm: &VarMap, dev: &Device) -> Result<Vec<Tensor>> {
+fn build_state_prefix(cfg: &Config, vm: &VarMap, dev: &Device, dtype: DType) -> Result<Vec<Tensor>> {
     let n_heads = cfg.hidden_size / cfg.head_size;
     let shape = (n_heads, cfg.head_size, cfg.head_size);
     let mut out = Vec::with_capacity(cfg.num_hidden_layers);
@@ -225,7 +225,7 @@ fn build_state_prefix(cfg: &Config, vm: &VarMap, dev: &Device) -> Result<Vec<Ten
             shape,
             &format!("state_prefix.{layer}"),
             candle_nn::Init::Const(0.0),
-            DType::F32,
+            dtype,
             dev,
         )?;
         out.push(t);

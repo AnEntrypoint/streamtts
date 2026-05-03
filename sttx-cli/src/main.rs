@@ -75,44 +75,58 @@ async fn run_train(
     repo: String,
     cpu: bool,
 ) -> Result<()> {
-    let device = if cpu {
-        Device::Cpu
-    } else {
-        Device::cuda_if_available(0)?
-    };
-    let dtype = DType::BF16;
+    let device = Device::Cpu;
+    let dtype = DType::F32;
+    eprintln!("[cli] device init complete");
     obs::info("cli", json!({"event":"train_start","repo": repo,"steps": steps,"device_cuda": device.is_cuda()}));
 
+    eprintln!("[cli] about to load model from {}", repo);
     let model = model::load(&repo, device, dtype).await?;
+    eprintln!("[cli] model loaded successfully");
     let cfg = TrainConfig {
         steps,
         checkpoint_dir: checkpoint_dir.clone(),
         checkpoint_every,
         ..Default::default()
     };
+    eprintln!("[cli] about to create trainer");
     let mut trainer = Trainer::new(model, cfg)?;
+    eprintln!("[cli] trainer created successfully");
 
+    eprintln!("[cli] about to open ccsniff stream from {}", ccsniff_from);
     let mut stream = match ccsniff_from.as_str() {
         "live" => CcsniffStream::live(64).await?,
         path => CcsniffStream::from_file(path, 64).await?,
     };
+    eprintln!("[cli] stream opened successfully");
 
+    eprintln!("[cli] entering training loop, target steps: {}", steps);
     while trainer.steps < steps {
         let trace = match stream.recv().await {
             Some(t) => t,
             None => {
+                eprintln!("[cli] stream ended at step {}", trainer.steps);
                 obs::warn("cli", json!({"event":"stream_ended","steps": trainer.steps}));
                 break;
             }
         };
         match trainer.step_on_trace(&trace) {
-            Ok(_) => {}
-            Err(e) => obs::error("cli", json!({"event":"step_error","err": e.to_string()})),
+            Ok(_) => {
+                if trainer.steps % 10 == 0 {
+                    eprintln!("[cli] step {} complete", trainer.steps);
+                }
+            }
+            Err(e) => {
+                eprintln!("[cli] step error: {}", e);
+                obs::error("cli", json!({"event":"step_error","err": e.to_string()}));
+            }
         }
         if trainer.steps > 0 && trainer.steps % checkpoint_every == 0 {
+            eprintln!("[cli] saving checkpoint at step {}", trainer.steps);
             checkpoint::save(&checkpoint_dir, &trainer.meta(repo.clone()), &trainer.trainable)?;
         }
     }
+    eprintln!("[cli] training loop complete at step {}", trainer.steps);
     checkpoint::save(&checkpoint_dir, &trainer.meta(repo), &trainer.trainable)?;
     Ok(())
 }

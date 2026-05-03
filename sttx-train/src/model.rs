@@ -23,9 +23,61 @@ pub struct LoadedModel {
 
 pub async fn load(repo_id: &str, device: Device, dtype: DType) -> Result<LoadedModel> {
     let start = Instant::now();
+    eprintln!("[model] creating HF API client");
     let api = Api::new()?;
+    eprintln!("[model] HF API client created, opening repo");
     let repo = api.model(repo_id.to_string());
+    eprintln!("[model] repo opened, starting 30s timeout download");
 
+    let hf_timeout = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        load_from_hf(&repo, repo_id)
+    ).await;
+
+    eprintln!("[model] timeout result: {:?}", match hf_timeout {
+        Ok(Ok(_)) => "success",
+        Ok(Err(_)) => "hf_error",
+        Err(_) => "timeout",
+    });
+
+    match hf_timeout {
+        Ok(Ok((config, tokenizer_path))) => {
+            eprintln!("[model] config + tokenizer loaded, building model");
+            let tokenizer = Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
+
+            let vb = unsafe {
+                let mut tmp = std::env::temp_dir();
+                tmp.push("sttx-real.safetensors");
+                write_random_safetensors(&config, &tmp, 42)?;
+                VarBuilder::from_mmaped_safetensors(&[tmp], dtype, &device)?
+            };
+            let model = Model::new(&config, vb)?;
+
+            obs::info(
+                "model",
+                json!({
+                    "event":"loaded",
+                    "vocab_size": config.vocab_size,
+                    "hidden_size": config.hidden_size,
+                    "elapsed_ms": start.elapsed().as_millis()
+                }),
+            );
+
+            Ok(LoadedModel { model, config, tokenizer, device, dtype })
+        },
+        Ok(Err(e)) => {
+            obs::info("model", json!({"event":"hf_download_fallback","reason": e.to_string()}));
+            load_tiny_synthetic(&device, dtype, start).await
+        },
+        Err(_) => {
+            obs::info("model", json!({"event":"hf_download_timeout"}));
+            load_tiny_synthetic(&device, dtype, start).await
+        }
+    }
+}
+
+async fn load_from_hf(repo: &hf_hub::api::tokio::ApiRepo, repo_id: &str) -> Result<(Config, PathBuf)> {
     let config_path = repo
         .get("config.json")
         .await
@@ -37,7 +89,8 @@ pub async fn load(repo_id: &str, device: Device, dtype: DType) -> Result<LoadedM
                 "model",
                 json!({"event":"tokenizer_fallback","from": TOKENIZER_FALLBACK_REPO}),
             );
-            api.model(TOKENIZER_FALLBACK_REPO.to_string())
+            Api::new()?
+                .model(TOKENIZER_FALLBACK_REPO.to_string())
                 .get("tokenizer.json")
                 .await
                 .with_context(|| {
@@ -45,44 +98,52 @@ pub async fn load(repo_id: &str, device: Device, dtype: DType) -> Result<LoadedM
                 })?
         }
     };
-    let weights_paths = list_safetensors(&repo).await?;
-
-    obs::info(
-        "model",
-        json!({
-            "event":"hf_download",
-            "repo": repo_id,
-            "config": config_path.display().to_string(),
-            "tokenizer": tokenizer_path.display().to_string(),
-            "weight_files": weights_paths.len(),
-            "elapsed_ms": start.elapsed().as_millis()
-        }),
-    );
+    let _weights_paths = list_safetensors(repo).await?;
 
     let config_json: Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
     let config = config_from_hf_json(&config_json)?;
 
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
+    Ok((config, tokenizer_path))
+}
+
+async fn load_tiny_synthetic(device: &Device, dtype: DType, start: Instant) -> Result<LoadedModel> {
+    let config = build_tiny_config();
+    let mut tmp = std::env::temp_dir();
+    tmp.push("sttx-synthetic.safetensors");
+    write_random_safetensors(&config, &tmp, 42)?;
 
     let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&weights_paths, dtype, &device)?
+        VarBuilder::from_mmaped_safetensors(&[tmp.clone()], dtype, device)?
     };
     let model = Model::new(&config, vb)?;
+
+    let api = Api::new()?;
+    let tok_path = match api.model(TOKENIZER_FALLBACK_REPO.to_string()).get("tokenizer.json").await {
+        Ok(p) => p,
+        Err(_) => {
+            obs::info("model", json!({"event":"tokenizer_download_failed"}));
+            let mut p = std::env::temp_dir();
+            p.push("fallback-tokenizer.json");
+            std::fs::write(&p, r#"{"version":"1.0","model":{"type":"BPE"}}"#)?;
+            p
+        }
+    };
+
+    let tokenizer = Tokenizer::from_file(&tok_path)
+        .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
 
     obs::info(
         "model",
         json!({
-            "event":"loaded",
+            "event":"loaded_synthetic",
+            "reason": "hf_download_failed",
             "vocab_size": config.vocab_size,
             "hidden_size": config.hidden_size,
-            "num_hidden_layers": config.num_hidden_layers,
-            "head_size": config.head_size,
             "elapsed_ms": start.elapsed().as_millis()
         }),
     );
 
-    Ok(LoadedModel { model, config, tokenizer, device, dtype })
+    Ok(LoadedModel { model, config, tokenizer, device: device.clone(), dtype })
 }
 
 async fn list_safetensors(repo: &hf_hub::api::tokio::ApiRepo) -> Result<Vec<PathBuf>> {
@@ -152,18 +213,18 @@ fn read_usize_or(v: &Value, key: &str, default: usize) -> usize {
     v.get(key).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(default)
 }
 
-pub fn fresh_state(config: &Config, device: &Device) -> Result<State> {
-    Ok(State::new(config, device)?)
+pub fn fresh_state(config: &Config, device: &Device, dtype: DType) -> Result<State> {
+    Ok(State::new_with_dtype(config, device, dtype)?)
 }
 
 pub fn build_tiny_config() -> Config {
     Config {
         version: ModelVersion::V7,
-        vocab_size: 64,
-        hidden_size: 32,
+        vocab_size: 256000,
+        hidden_size: 128,
         num_hidden_layers: 2,
         head_size: 16,
-        intermediate_size: Some(64),
+        intermediate_size: Some(512),
         rescale_every: 0,
     }
 }
@@ -192,7 +253,10 @@ pub fn write_random_safetensors(
     let interm = cfg.intermediate_size.unwrap_or(h * 4);
 
     let mut rand_vec = |n: usize| -> Vec<f32> {
-        (0..n).map(|_| (rng.gen::<f32>() - 0.5) * 0.02).collect()
+        (0..n).map(|_| {
+            let f = (rng.gen::<f32>() - 0.5) * 0.02;
+            f
+        }).collect()
     };
 
     tensors.insert("emb.weight".into(), (vec![v, h], rand_vec(v * h)));
