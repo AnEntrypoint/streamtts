@@ -10,6 +10,7 @@ Cargo.lock.bak
 .gm/prd.yml
 .gm/turn-state.json
 .gm/turn-state.json.corrupted-*
+.gm/residual-check-fired
 .gm/lastskill
 .gm/rs-learn.db
 .gm/rs-learn.db-*
