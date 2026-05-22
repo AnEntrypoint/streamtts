@@ -2,6 +2,14 @@
 **/*.rs.bck
 Cargo.lock.bak
 .gm/log/
+.gm/exec-spool/
+.gm/last-instruction-ts
+.gm/last-prompt.txt
+.gm/mutables.yml
+.gm/next-step.md
+.gm/prd.yml
+.gm/turn-state.json
+.gm/turn-state.json.corrupted-*
 .gm/lastskill
 .gm/rs-learn.db
 .gm/rs-learn.db-*
@@ -52,3 +60,15 @@ ccsniff-export.err
 CLAUDE.md
 *.log
 vendor/
+
+# Pre-existing untracked artifacts (data, build outputs, side examples)
+.github/workflows/build-and-deploy.yml
+bin/
+ccsniff-fresh.ndjson
+ccsniff-full-history.ndjson
+docs/
+sttx-train/examples/
+test-data/
+train.err
+train.pid
+train.out
