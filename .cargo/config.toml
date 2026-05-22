@@ -4,4 +4,9 @@ codegen-units = 1
 lto = "thin"
 
 [target.x86_64-pc-windows-msvc]
-linker = "link.exe"
+# Hardcode MSVC linker absolute path so a bare "link.exe" doesn't accidentally
+# resolve to Git's coreutils `link` (in C:\Program Files\Git\usr\bin\link.exe),
+# which has no -dynamicbase flag and fails every build script with
+# "link: unknown option -- dynamicbase". If you upgrade Visual Studio and the
+# MSVC toolset version changes, update the path below or set $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER.
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe"

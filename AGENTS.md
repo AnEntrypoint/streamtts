@@ -124,6 +124,23 @@ For very tight VRAM, drop `--chunk-size` to 512 or 256. For maximum throughput o
 
 **Rust version**: Requires rustc 1.86+ due to candle-core `is_multiple_of` unstable feature. Use `rustup default stable && rustup update` or `rustup default nightly`.
 
+### Host toolchain quirks on this Windows box
+
+Three traps shadow the correct toolchain on this machine; `.\build.ps1` neutralizes all of them so you don't have to think about it:
+
+1. **Chocolatey installed `rustc.exe` 1.85.1 with the x86_64-pc-windows-gnu target** at `C:\ProgramData\chocolatey\bin`, which sits ahead of `~\.cargo\bin` on PATH and shadows rustup's 1.95.0-msvc. If cargo picks up that rustc, it emits GNU-linker args (`i386pep`, `--dynamicbase`, `-lkernel32`) that MSVC `link.exe` cannot parse. To clear permanently: `choco uninstall rust -y`. Until then, `build.ps1` strips `\chocolatey\bin` from `$env:PATH` and sets `$env:RUSTC` to rustup's rustc.
+2. **Git ships a `link.exe`** (coreutils `link`) at `C:\Program Files\Git\usr\bin\link.exe`. When earlier on PATH than MSVC's `Hostx64\x64\link.exe`, every build script fails with `link: unknown option -- dynamicbase`. `.cargo/config.toml` now hardcodes the MSVC linker absolute path; `build.ps1` additionally strips `Git\usr\bin` from PATH during the invocation.
+3. **MSVC `link.exe` requires `INCLUDE`/`LIB`/`LIBPATH` env from `vcvars64.bat`**. `build.ps1` sources those once per session before invoking cargo.
+
+#### Usage
+
+```powershell
+.\build.ps1                                   # cargo build --release -p sttx-cli
+.\build.ps1 check                             # cargo check -p sttx-cli
+.\build.ps1 train --ccsniff-from foo.ndjson   # cargo run --release -p sttx-cli -- train ...
+.\build.ps1 raw -- test --workspace           # any cargo invocation, defaults bypassed
+```
+
 ### What Happens
 
 1. **Load**: Downloads RWKV-7 1.5B safetensors from HuggingFace (~3 GB, first run only)
