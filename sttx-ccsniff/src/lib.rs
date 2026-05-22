@@ -156,6 +156,102 @@ impl CcsniffStream {
     pub async fn recv(&mut self) -> Option<Trace> {
         self.rx.recv().await
     }
+
+    /// Read JSONL files produced by ai-data-extraction (`bun run extract:all`).
+    /// Each line is either `{"messages":[{"role","content"},...]}` (default),
+    /// `{"conversations":[{"from","value"},...]}` (sharegpt), or
+    /// `{"text":"<chat-templated string>"}` (gemma4). We support the first two
+    /// natively; the third is emitted as a single AssistantMessage.
+    /// Each line yields one Trace::Pair per user→assistant turn pair, plus
+    /// orphan messages as plain User/AssistantMessage traces.
+    pub async fn from_jsonl_messages(paths: &[&str], channel_capacity: usize) -> Result<Self> {
+        let mut traces: Vec<Trace> = Vec::new();
+        for path in paths {
+            eprintln!("[ccsniff/jsonl] reading {}", path);
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("read {path}"))?;
+            for line in content.lines() {
+                if line.trim().is_empty() { continue; }
+                let v: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[ccsniff/jsonl] parse error: {}", e);
+                        continue;
+                    }
+                };
+                push_jsonl_traces(&v, &mut traces);
+            }
+        }
+        eprintln!("[ccsniff/jsonl] parsed {} traces", traces.len());
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        tokio::spawn(async move {
+            for trace in traces.into_iter() {
+                if tx.send(trace).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self { rx, _child: None })
+    }
+}
+
+fn push_jsonl_traces(v: &serde_json::Value, out: &mut Vec<Trace>) {
+    // messages format
+    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+        consume_role_value_pairs(msgs, "role", "content", out);
+        return;
+    }
+    // sharegpt format
+    if let Some(convs) = v.get("conversations").and_then(|m| m.as_array()) {
+        consume_role_value_pairs(convs, "from", "value", out);
+        return;
+    }
+    // gemma4 pre-rendered text
+    if let Some(t) = v.get("text").and_then(|t| t.as_str()) {
+        if !t.is_empty() {
+            out.push(Trace::AssistantMessage { text: t.to_string() });
+        }
+    }
+}
+
+fn consume_role_value_pairs(arr: &[serde_json::Value], role_key: &str, text_key: &str, out: &mut Vec<Trace>) {
+    let mut pending_user: Option<String> = None;
+    for m in arr {
+        let role = m.get(role_key).and_then(|r| r.as_str()).unwrap_or("");
+        let content = m.get(text_key).and_then(|c| c.as_str()).unwrap_or("").to_string();
+        if content.is_empty() { continue; }
+        let normalized_role = match role {
+            "user" | "human" => "user",
+            "assistant" | "gpt" | "model" => "assistant",
+            "system" => "system",
+            _ => "other",
+        };
+        match normalized_role {
+            "user" => {
+                if let Some(prev) = pending_user.take() {
+                    out.push(Trace::UserMessage { text: prev });
+                }
+                pending_user = Some(content);
+            }
+            "assistant" => {
+                if let Some(prompt) = pending_user.take() {
+                    out.push(Trace::Pair { prompt, completion: content });
+                } else {
+                    out.push(Trace::AssistantMessage { text: content });
+                }
+            }
+            _ => {
+                // System / unknown -> emit as user-side context to feed the model.
+                if let Some(prev) = pending_user.take() {
+                    out.push(Trace::UserMessage { text: prev });
+                }
+                out.push(Trace::UserMessage { text: content });
+            }
+        }
+    }
+    if let Some(prev) = pending_user.take() {
+        out.push(Trace::UserMessage { text: prev });
+    }
 }
 
 fn build_pairs(events: Vec<serde_json::Value>) -> Vec<Trace> {

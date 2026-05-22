@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use candle_core::{DType, Device};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 use sttx_ccsniff::CcsniffStream;
 use sttx_core::obs;
@@ -11,6 +11,46 @@ use sttx_train::checkpoint::{self, CheckpointMeta};
 use sttx_train::model::{self, DEFAULT_MODEL_REPO};
 use sttx_train::serve;
 use sttx_train::train::{TrainConfig, Trainer};
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DTypeArg {
+    Bf16,
+    F16,
+    F32,
+}
+
+impl DTypeArg {
+    fn into_dtype(self) -> DType {
+        match self {
+            DTypeArg::Bf16 => DType::BF16,
+            DTypeArg::F16 => DType::F16,
+            DTypeArg::F32 => DType::F32,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DeviceArg {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl DeviceArg {
+    fn into_device(self) -> Result<Device> {
+        Ok(match self {
+            DeviceArg::Cpu => Device::Cpu,
+            DeviceArg::Cuda => Device::new_cuda(0)?,
+            DeviceArg::Auto => {
+                if candle_core::utils::cuda_is_available() {
+                    Device::new_cuda(0)?
+                } else {
+                    Device::Cpu
+                }
+            }
+        })
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -26,8 +66,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Train {
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., default_values_t = Vec::<String>::new())]
         ccsniff_from: Vec<String>,
+        /// Read JSONL files produced by ai-data-extraction (`bun run extract:all`).
+        /// Each line: {"messages":[{"role":"user|assistant","content":"..."}, ...]}.
+        #[arg(long, num_args = 1.., default_values_t = Vec::<String>::new())]
+        jsonl_from: Vec<String>,
         #[arg(long, default_value_t = 1000)]
         steps: u64,
         #[arg(long, default_value = "ckpt")]
@@ -36,8 +80,21 @@ enum Cmd {
         checkpoint_every: u64,
         #[arg(long, default_value = DEFAULT_MODEL_REPO)]
         model_repo: String,
+        /// Deprecated alias for --device cpu.
         #[arg(long, default_value_t = false)]
         cpu: bool,
+        #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
+        #[arg(long, value_enum, default_value_t = DTypeArg::Bf16)]
+        dtype: DTypeArg,
+        /// Maximum tokens of context per training step (truncated BPTT).
+        /// Bounded only by memory once chunk-size keeps activations small.
+        #[arg(long, default_value_t = 131072)]
+        ctx_len: usize,
+        /// Activation-bound chunk size for truncated BPTT.
+        /// Memory is O(chunk_size), not O(ctx_len). Default 1024 is conservative.
+        #[arg(long, default_value_t = 1024)]
+        chunk_size: usize,
         #[arg(long, default_value_t = false)]
         api_pairs: bool,
     },
@@ -48,6 +105,10 @@ enum Cmd {
         port: u16,
         #[arg(long, default_value_t = 200)]
         max_tokens: usize,
+        #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
+        #[arg(long, value_enum, default_value_t = DTypeArg::Bf16)]
+        dtype: DTypeArg,
     },
     Inspect {
         #[arg(long)]
@@ -60,8 +121,10 @@ enum Cmd {
         top: usize,
     },
     ValidateData {
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., default_values_t = Vec::<String>::new())]
         ccsniff_from: Vec<String>,
+        #[arg(long, num_args = 1.., default_values_t = Vec::<String>::new())]
+        jsonl_from: Vec<String>,
         #[arg(long, default_value_t = false)]
         api_pairs: bool,
     },
@@ -72,6 +135,10 @@ enum Cmd {
         steps: u64,
         #[arg(long, default_value = DEFAULT_MODEL_REPO)]
         model_repo: String,
+        #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+        device: DeviceArg,
+        #[arg(long, value_enum, default_value_t = DTypeArg::Bf16)]
+        dtype: DTypeArg,
     },
 }
 
@@ -81,36 +148,59 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Train {
             ccsniff_from,
+            jsonl_from,
             steps,
             checkpoint_dir,
             checkpoint_every,
             model_repo,
             cpu,
+            device,
+            dtype,
+            ctx_len,
+            chunk_size,
             api_pairs,
-        } => run_train(ccsniff_from, steps, checkpoint_dir, checkpoint_every, model_repo, cpu, api_pairs).await,
-        Cmd::Serve { checkpoint, port, max_tokens } => {
-            serve::run(checkpoint, port, max_tokens).await
+        } => {
+            let device = if cpu { DeviceArg::Cpu } else { device };
+            run_train(
+                ccsniff_from, jsonl_from, steps, checkpoint_dir, checkpoint_every,
+                model_repo, device, dtype, ctx_len, chunk_size, api_pairs,
+            ).await
+        }
+        Cmd::Serve { checkpoint, port, max_tokens, device, dtype } => {
+            serve::run(checkpoint, port, max_tokens, device.into_device()?, dtype.into_dtype()).await
         }
         Cmd::Inspect { checkpoint } => run_inspect(checkpoint),
         Cmd::MergeStats { checkpoint, top } => run_merge_stats(checkpoint, top),
-        Cmd::ValidateData { ccsniff_from, api_pairs } => run_validate_data(ccsniff_from, api_pairs).await,
-        Cmd::QualityAssert { checkpoint, steps, model_repo } => run_quality_assert(checkpoint, steps, model_repo).await,
+        Cmd::ValidateData { ccsniff_from, jsonl_from, api_pairs } => {
+            run_validate_data(ccsniff_from, jsonl_from, api_pairs).await
+        }
+        Cmd::QualityAssert { checkpoint, steps, model_repo, device, dtype } => {
+            run_quality_assert(checkpoint, steps, model_repo, device.into_device()?, dtype.into_dtype()).await
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_train(
     ccsniff_from: Vec<String>,
+    jsonl_from: Vec<String>,
     steps: u64,
     checkpoint_dir: PathBuf,
     checkpoint_every: u64,
     repo: String,
-    _cpu: bool,
+    device: DeviceArg,
+    dtype: DTypeArg,
+    ctx_len: usize,
+    chunk_size: usize,
     api_pairs: bool,
 ) -> Result<()> {
-    let device = Device::Cpu;
-    let dtype = DType::F32;
-    eprintln!("[cli] device init complete");
-    obs::info("cli", json!({"event":"train_start","repo": repo,"steps": steps,"api_pairs": api_pairs}));
+    let device = device.into_device()?;
+    let dtype = dtype.into_dtype();
+    eprintln!("[cli] device={:?} dtype={:?} ctx_len={} chunk_size={}", device, dtype, ctx_len, chunk_size);
+    obs::info("cli", json!({
+        "event":"train_start","repo": repo,"steps": steps,"api_pairs": api_pairs,
+        "ctx_len": ctx_len, "chunk_size": chunk_size, "dtype": format!("{:?}", dtype),
+    }));
 
     eprintln!("[cli] about to load model from {}", repo);
     let model = model::load(&repo, device, dtype).await?;
@@ -119,22 +209,15 @@ async fn run_train(
         steps,
         checkpoint_dir: checkpoint_dir.clone(),
         checkpoint_every,
+        ctx_len,
+        chunk_size,
         ..Default::default()
     };
     eprintln!("[cli] about to create trainer");
     let mut trainer = Trainer::new(model, cfg)?;
     eprintln!("[cli] trainer created successfully");
 
-    let sources: Vec<&str> = ccsniff_from.iter().map(String::as_str).collect();
-    let source_desc = sources.join(", ");
-    eprintln!("[cli] about to open ccsniff stream from {} (api_pairs={})", source_desc, api_pairs);
-    let mut stream = if sources == ["live"] {
-        CcsniffStream::live(64).await?
-    } else if api_pairs {
-        CcsniffStream::from_files_paired(&sources, 64).await?
-    } else {
-        CcsniffStream::from_files(&sources, 64, false).await?
-    };
+    let mut stream = open_stream(&ccsniff_from, &jsonl_from, api_pairs).await?;
     eprintln!("[cli] stream opened successfully");
 
     eprintln!("[cli] entering training loop, target steps: {}", steps);
@@ -168,6 +251,26 @@ async fn run_train(
     Ok(())
 }
 
+async fn open_stream(ccsniff_from: &[String], jsonl_from: &[String], api_pairs: bool) -> Result<CcsniffStream> {
+    let ccsniff_sources: Vec<&str> = ccsniff_from.iter().map(String::as_str).collect();
+    let jsonl_sources: Vec<&str> = jsonl_from.iter().map(String::as_str).collect();
+
+    if !jsonl_sources.is_empty() && !ccsniff_sources.is_empty() {
+        anyhow::bail!("pass either --ccsniff-from or --jsonl-from, not both");
+    }
+    if !jsonl_sources.is_empty() {
+        return CcsniffStream::from_jsonl_messages(&jsonl_sources, 64).await;
+    }
+    if ccsniff_sources == ["live"] {
+        return CcsniffStream::live(64).await;
+    }
+    if api_pairs {
+        CcsniffStream::from_files_paired(&ccsniff_sources, 64).await
+    } else {
+        CcsniffStream::from_files(&ccsniff_sources, 64, false).await
+    }
+}
+
 fn run_inspect(checkpoint: PathBuf) -> Result<()> {
     let meta = checkpoint::load_meta(&checkpoint)?;
     println!("{}", serde_json::to_string_pretty(&meta)?);
@@ -189,13 +292,8 @@ fn run_merge_stats(checkpoint: PathBuf, top: usize) -> Result<()> {
     Ok(())
 }
 
-async fn run_validate_data(ccsniff_from: Vec<String>, api_pairs: bool) -> Result<()> {
-    let sources: Vec<&str> = ccsniff_from.iter().map(String::as_str).collect();
-    let mut stream = if api_pairs {
-        CcsniffStream::from_files_paired(&sources, 64).await?
-    } else {
-        CcsniffStream::from_files(&sources, 64, false).await?
-    };
+async fn run_validate_data(ccsniff_from: Vec<String>, jsonl_from: Vec<String>, api_pairs: bool) -> Result<()> {
+    let mut stream = open_stream(&ccsniff_from, &jsonl_from, api_pairs).await?;
     let mut count = 0u64;
     let mut non_empty = 0u64;
     while let Some(trace) = stream.recv().await {
@@ -205,7 +303,8 @@ async fn run_validate_data(ccsniff_from: Vec<String>, api_pairs: bool) -> Result
         }
     }
     println!("{}", json!({
-        "sources": ccsniff_from,
+        "ccsniff_from": ccsniff_from,
+        "jsonl_from": jsonl_from,
         "api_pairs": api_pairs,
         "traces_total": count,
         "traces_non_empty": non_empty,
@@ -213,9 +312,7 @@ async fn run_validate_data(ccsniff_from: Vec<String>, api_pairs: bool) -> Result
     Ok(())
 }
 
-async fn run_quality_assert(checkpoint: PathBuf, steps: u64, model_repo: String) -> Result<()> {
-    let device = Device::Cpu;
-    let dtype = DType::F32;
+async fn run_quality_assert(checkpoint: PathBuf, steps: u64, model_repo: String, device: Device, dtype: DType) -> Result<()> {
     let meta = checkpoint::load_meta(&checkpoint)?;
     eprintln!("[quality] checkpoint steps={} recent_loss_mean={:.4}",
         meta.steps,

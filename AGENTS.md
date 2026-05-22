@@ -95,8 +95,32 @@ cargo run --release -p sttx-cli -- train \
   --steps 100000 \
   --checkpoint-dir ckpt-full-history \
   --checkpoint-every 1000 \
-  --model-repo RWKV/RWKV7-Goose-World3-1.5B-HF
+  --model-repo RWKV/RWKV7-Goose-World3-1.5B-HF \
+  --device auto --dtype bf16 \
+  --ctx-len 131072 --chunk-size 1024
 ```
+
+Or ingest from ai-data-extraction's multi-tool JSONL output (claude, cursor, codex, opencode, continue, gemini, trae, windsurf):
+
+```bash
+# In C:\dev\ai-data-extraction:
+bun run extract:all
+# Back in streamtts:
+cargo run --release -p sttx-cli -- train \
+  --jsonl-from C:/dev/ai-data-extraction/extracted_data/ALL_*.jsonl \
+  --device auto --dtype bf16 \
+  --ctx-len 131072 --chunk-size 1024
+```
+
+## Memory budget — 5 GB RAM / 5 GB VRAM constraint (2026-05-22)
+
+The original loop hardcoded `Device::Cpu` + `DType::F32`, upcasting BF16-on-disk weights to ~6 GB and OOMing immediately. The cap `max_tokens_per_step: 256` further limited context. Fixed in three changes:
+
+1. **`--dtype bf16` is now default** — keeps the 1.5B model at ~3 GB in RAM (matches the disk shard size). `--dtype f16` and `f32` available; `f32` will OOM on 5 GB hardware.
+2. **`--device auto|cpu|cuda`** — picks CUDA when `candle_core::utils::cuda_is_available()`. Build with `--features cuda` on cudarc-compatible hardware.
+3. **Truncated BPTT chunking** (`Trainer::chunked_backward` in `sttx-train/src/train.rs`): per training step, the sequence is sliced into `--chunk-size` windows (default 1024). Each chunk runs forward_seq + CE + `optimizer.backward_step` independently, then every `StatePerLayer` tensor (`att_x_prev`, `att_kv`, `ffn_x_prev`) is `.detach()`ed before the next chunk. Activation peak memory becomes `O(chunk_size)` instead of `O(ctx_len)`. RWKV-7's recurrent state is constant-size, so the reachable context length is bounded only by data length and wall-clock — defaulting `--ctx-len` to 131072 is now safe on the 5 GB budget.
+
+For very tight VRAM, drop `--chunk-size` to 512 or 256. For maximum throughput on plentiful memory, raise it to 4096+. `--ctx-len` can be raised arbitrarily for long-document training; the cost is wall-clock, not memory.
 
 **Rust version**: Requires rustc 1.86+ due to candle-core `is_multiple_of` unstable feature. Use `rustup default stable && rustup update` or `rustup default nightly`.
 

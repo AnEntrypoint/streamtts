@@ -21,10 +21,8 @@ pub struct InferenceEngine {
 }
 
 impl InferenceEngine {
-    pub async fn load(checkpoint_dir: PathBuf, max_tokens: usize) -> Result<Self> {
+    pub async fn load(checkpoint_dir: PathBuf, max_tokens: usize, device: Device, dtype: DType) -> Result<Self> {
         let meta = checkpoint::load_meta(&checkpoint_dir)?;
-        let device = Device::Cpu;
-        let dtype = DType::F32;
 
         obs::info("serve", json!({"event":"loading","repo": meta.repo_id,"steps": meta.steps}));
         let loaded = model::load(&meta.repo_id, device, dtype).await?;
@@ -83,8 +81,8 @@ fn argmax_last(logits: &Tensor) -> Result<u32> {
     Ok(idx as u32)
 }
 
-pub async fn run(checkpoint: PathBuf, port: u16, max_tokens: usize) -> Result<()> {
-    let engine = Arc::new(InferenceEngine::load(checkpoint, max_tokens).await?);
+pub async fn run(checkpoint: PathBuf, port: u16, max_tokens: usize, device: Device, dtype: DType) -> Result<()> {
+    let engine = Arc::new(InferenceEngine::load(checkpoint, max_tokens, device, dtype).await?);
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     eprintln!("[serve] listening on 0.0.0.0:{port}");
     obs::info("serve", json!({"event":"listening","port": port}));

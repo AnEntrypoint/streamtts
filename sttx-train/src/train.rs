@@ -18,7 +18,13 @@ use crate::tokens;
 
 pub struct TrainConfig {
     pub steps: u64,
-    pub max_tokens_per_step: usize,
+    /// Maximum tokens fed per training step (whole-sequence cap).
+    /// Activation memory is bounded by `chunk_size`, not this value, so this can be
+    /// raised to 128k+ as long as `chunk_size` stays small.
+    pub ctx_len: usize,
+    /// Chunk size for truncated BPTT: the autograd graph is materialized for one
+    /// chunk at a time and detached between chunks. RAM/VRAM peak is O(chunk_size).
+    pub chunk_size: usize,
     pub replay_capacity: usize,
     pub replay_per_step: usize,
     pub replay_weight: f32,
@@ -32,7 +38,8 @@ impl Default for TrainConfig {
     fn default() -> Self {
         Self {
             steps: 1000,
-            max_tokens_per_step: 256,
+            ctx_len: 131072,
+            chunk_size: 1024,
             replay_capacity: 1000,
             replay_per_step: 3,
             replay_weight: 0.2,
@@ -121,15 +128,13 @@ impl Trainer {
         let model_ids = tokens::flatten_for_model(&merged, &self.dyn_tk);
         let truncated: Vec<u32> = model_ids
             .into_iter()
-            .take(self.cfg.max_tokens_per_step + 1)
+            .take(self.cfg.ctx_len + 1)
             .collect();
         if truncated.len() < 2 {
             return Ok(0.0);
         }
 
-        let loss = self.forward_loss(&truncated)?;
-        let surprise = loss.to_dtype(DType::F32)?.to_vec0::<f32>()?;
-        self.optimizer.backward_step(&loss)?;
+        let surprise = self.chunked_backward(&truncated)?;
 
         self.replay.add(Record {
             input_ids: truncated[..truncated.len() - 1].to_vec(),
@@ -154,9 +159,8 @@ impl Trainer {
             if sample.len() < 2 {
                 continue;
             }
-            let r_loss = self.forward_loss(&sample)?;
-            let scaled = r_loss.affine(self.cfg.replay_weight as f64, 0.0)?;
-            self.optimizer.backward_step(&scaled)?;
+            // Chunked replay: same activation budget as live step, scaled loss.
+            self.chunked_backward_scaled(&sample, self.cfg.replay_weight as f64)?;
         }
 
         self.steps += 1;
@@ -185,11 +189,9 @@ impl Trainer {
         let truncated: Vec<u32> = token_ids
             .iter()
             .copied()
-            .take(self.cfg.max_tokens_per_step + 1)
+            .take(self.cfg.ctx_len + 1)
             .collect();
-        let loss = self.forward_loss(&truncated)?;
-        let surprise = loss.to_dtype(DType::F32)?.to_vec0::<f32>()?;
-        self.optimizer.backward_step(&loss)?;
+        let surprise = self.chunked_backward(&truncated)?;
         self.replay.add(Record {
             input_ids: truncated[..truncated.len() - 1].to_vec(),
             target_ids: truncated[1..].to_vec(),
@@ -205,6 +207,86 @@ impl Trainer {
             json!({"event":"step_ids","step": self.steps,"loss": surprise,"tokens": truncated.len()}),
         );
         Ok(surprise)
+    }
+
+    /// Truncated BPTT over `token_ids`. Splits the sequence into chunks of
+    /// `cfg.chunk_size`, runs forward_seq + CE + backward per chunk, and detaches
+    /// the recurrent state between chunks so the autograd graph never spans the
+    /// full sequence. Activation memory peak is O(chunk_size), not O(len).
+    /// Returns mean per-token loss (F32) across all chunks for logging.
+    pub fn chunked_backward(&mut self, token_ids: &[u32]) -> Result<f32> {
+        self.chunked_backward_scaled(token_ids, 1.0)
+    }
+
+    pub fn chunked_backward_scaled(&mut self, token_ids: &[u32], scale: f64) -> Result<f32> {
+        if token_ids.len() < 2 {
+            return Ok(0.0);
+        }
+        let chunk = self.cfg.chunk_size.max(1);
+        let mut state = fresh_state(&self.model.config, &self.model.device, self.model.dtype)?;
+        for (layer_idx, prefix) in self.state_prefix.iter().enumerate() {
+            state.per_layer[layer_idx].att_kv = prefix.clone();
+        }
+
+        let mut total_loss: f32 = 0.0;
+        let mut total_tokens: usize = 0;
+        // Slide a window of (chunk + 1) tokens (last is the final target).
+        // Inputs per window: chunk tokens. Targets: tokens 1..=chunk.
+        let mut start = 0usize;
+        while start + 1 < token_ids.len() {
+            let end = (start + chunk + 1).min(token_ids.len());
+            let window = &token_ids[start..end];
+            if window.len() < 2 {
+                break;
+            }
+            let input = &window[..window.len() - 1];
+            let targets = &window[1..];
+
+            let logits_raw = self.model.model.forward_seq(input, &mut state)?;
+            let (logits_frozen, target_t) = match logits_raw.rank() {
+                1 => (
+                    logits_raw.unsqueeze(0)?,
+                    Tensor::new(&[*targets.last().unwrap()], &self.model.device)?,
+                ),
+                2 => (logits_raw, Tensor::new(targets, &self.model.device)?),
+                3 => {
+                    let (_, s, v) = logits_raw.dims3()?;
+                    (logits_raw.reshape((s, v))?, Tensor::new(targets, &self.model.device)?)
+                }
+                _ => (logits_raw, Tensor::new(targets, &self.model.device)?),
+            };
+            let logits = logits_frozen
+                .broadcast_mul(&self.logit_scale)?
+                .broadcast_add(&self.logit_bias)?;
+            let loss = candle_nn::loss::cross_entropy(&logits, &target_t)?;
+            let loss_step = if (scale - 1.0).abs() < f64::EPSILON {
+                loss.clone()
+            } else {
+                loss.affine(scale, 0.0)?
+            };
+            let loss_val = loss.to_dtype(DType::F32)?.to_vec0::<f32>()?;
+            self.optimizer.backward_step(&loss_step)?;
+
+            // Detach state tensors so the next chunk's forward does not retain
+            // the previous chunk's autograd graph. Numerical values survive.
+            for layer in state.per_layer.iter_mut() {
+                layer.att_x_prev = layer.att_x_prev.detach();
+                layer.att_kv = layer.att_kv.detach();
+                layer.ffn_x_prev = layer.ffn_x_prev.detach();
+            }
+
+            let toks = input.len();
+            total_loss += loss_val * toks as f32;
+            total_tokens += toks;
+            // Advance by `chunk` tokens, overlap of 1 so next window's first input
+            // continues the prediction chain.
+            start += chunk;
+        }
+
+        if total_tokens == 0 {
+            return Ok(0.0);
+        }
+        Ok(total_loss / total_tokens as f32)
     }
 
     pub fn forward_loss(&self, token_ids: &[u32]) -> Result<Tensor> {
