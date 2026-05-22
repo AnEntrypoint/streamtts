@@ -12,13 +12,19 @@
 # Hostx64\x64\link.exe and the include/lib paths are correct.
 #
 # Usage:
-#   .\build.ps1                                       # cargo build --release -p sttx-cli
+#   .\build.ps1                                       # cargo build --release -p sttx-cli (CPU)
+#   .\build.ps1 -Cuda                                 # cargo build --release --features cuda
+#   .\build.ps1 -Cuda -Cudnn                          # cargo build --release --features cudnn
 #   .\build.ps1 check                                 # cargo check -p sttx-cli
+#   .\build.ps1 -Cuda check                           # cargo check --features cuda
 #   .\build.ps1 train --ccsniff-from foo.ndjson       # cargo run --release -p sttx-cli -- train ...
-#   .\build.ps1 raw -- check --workspace              # cargo check --workspace (bypass defaults)
+#   .\build.ps1 -Cuda train ...                       # cargo run --release --features cuda -- train ...
+#   .\build.ps1 raw -- check --workspace              # any cargo invocation (defaults bypassed)
 
 [CmdletBinding()]
 param(
+    [switch]$Cuda,
+    [switch]$Cudnn,
     [Parameter(ValueFromRemainingArguments=$true)]
     [string[]]$Args
 )
@@ -64,9 +70,74 @@ $env:PATH = ((,$RustupBin) + $pathParts) -join ';'
 $env:RUSTC = "$RustupBin\rustc.exe"
 $env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
 
+# CUDA feature flag: if -Cuda or -Cudnn was passed, verify CUDA toolkit is on
+# the system and pick the right cargo feature string.
+$featureFlag = $null
+if ($Cudnn) {
+    $Cuda = $true  # cudnn implies cuda
+    $featureFlag = 'cudnn'
+}
+elseif ($Cuda) {
+    $featureFlag = 'cuda'
+}
+
+if ($Cuda) {
+    if (-not $env:CUDA_PATH -or -not (Test-Path "$env:CUDA_PATH\bin\nvcc.exe")) {
+        throw "CUDA build requested but CUDA_PATH ($env:CUDA_PATH) does not contain bin\nvcc.exe. Install the CUDA Toolkit (12.x) or unset -Cuda."
+    }
+    Write-Host "[build.ps1] CUDA toolkit at $env:CUDA_PATH (feature=$featureFlag)" -ForegroundColor DarkGray
+    # cudarc's build script needs the CUDA bin dir on PATH for nvcc.exe.
+    $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+
+    # candle-kernels' build.rs auto-detects compute capability via nvidia-smi, but
+    # in sandboxed/locked-down shells nvidia-smi returns "permission denied". Fall
+    # back to detecting the GPU via WMI and mapping the model to its compute cap.
+    if (-not $env:CUDA_COMPUTE_CAP) {
+        try {
+            $gpu = Get-CimInstance Win32_VideoController -ErrorAction Stop |
+                Where-Object { $_.Name -match 'NVIDIA' } |
+                Select-Object -First 1 -ExpandProperty Name
+        } catch { $gpu = $null }
+        $cap = $null
+        if ($gpu) {
+            # Map a few common consumer/Ampere/Ada/Blackwell families to compute caps.
+            # Add rows here as new hardware lands.
+            $caps = @(
+                @{ Pattern = 'RTX 50';            Cap = '120' },  # Blackwell
+                @{ Pattern = 'RTX 40';            Cap = '89'  },  # Ada
+                @{ Pattern = 'RTX 30';            Cap = '86'  },  # Ampere
+                @{ Pattern = 'RTX 20';            Cap = '75'  },  # Turing
+                @{ Pattern = 'GTX 16';            Cap = '75'  },
+                @{ Pattern = 'GTX 10';            Cap = '61'  },  # Pascal
+                @{ Pattern = 'A100';              Cap = '80'  },
+                @{ Pattern = 'H100';              Cap = '90'  }
+            )
+            foreach ($row in $caps) {
+                if ($gpu -match $row.Pattern) { $cap = $row.Cap; break }
+            }
+        }
+        if ($cap) {
+            $env:CUDA_COMPUTE_CAP = $cap
+            Write-Host "[build.ps1] detected GPU '$gpu' -> CUDA_COMPUTE_CAP=$cap" -ForegroundColor DarkGray
+        } else {
+            Write-Warning "Could not detect GPU compute capability. Set `$env:CUDA_COMPUTE_CAP manually (e.g. 86 for RTX 30xx, 89 for RTX 40xx, 90 for H100)."
+        }
+    } else {
+        Write-Host "[build.ps1] using preset CUDA_COMPUTE_CAP=$env:CUDA_COMPUTE_CAP" -ForegroundColor DarkGray
+    }
+}
+
 # Decide which cargo invocation to run.
+function Add-FeatureFlag([string[]]$cmd) {
+    if ($featureFlag) {
+        # Insert --features <flag> right after the subcommand (cargo's expected position).
+        return @($cmd[0], '--features', $featureFlag) + $cmd[1..($cmd.Count - 1)]
+    }
+    return $cmd
+}
+
 if ($Args.Count -eq 0) {
-    $cargoArgs = @('build', '--release', '-p', 'sttx-cli')
+    $cargoArgs = Add-FeatureFlag @('build', '--release', '-p', 'sttx-cli')
 }
 else {
     $rest = if ($Args.Count -gt 1) { $Args[1..($Args.Count - 1)] } else { @() }
@@ -74,14 +145,18 @@ else {
         $cargoArgs = $rest
     }
     elseif ($Args[0] -eq 'check') {
-        $cargoArgs = @('check', '-p', 'sttx-cli') + $rest
+        $cargoArgs = Add-FeatureFlag (@('check', '-p', 'sttx-cli') + $rest)
     }
     elseif ($Args[0] -in @('train', 'serve', 'inspect', 'merge-stats', 'validate-data', 'quality-assert')) {
-        $cargoArgs = @('run', '--release', '-p', 'sttx-cli', '--') + $Args
+        $cargoArgs = Add-FeatureFlag (@('run', '--release', '-p', 'sttx-cli') + @('--')) + $Args
+        # Re-position --features before the `--` separator that splits cargo args from binary args.
+        if ($featureFlag) {
+            $cargoArgs = @('run', '--release', '-p', 'sttx-cli', '--features', $featureFlag, '--') + $Args
+        }
     }
     else {
         # Pass-through: e.g. .\build.ps1 test, .\build.ps1 clippy
-        $cargoArgs = $Args
+        $cargoArgs = if ($featureFlag) { Add-FeatureFlag $Args } else { $Args }
     }
 }
 

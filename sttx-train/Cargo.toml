@@ -34,3 +34,9 @@ chrono = { workspace = true }
 rand = { workspace = true }
 safetensors = "0.4"
 ahash = "0.8"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]

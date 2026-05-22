@@ -122,6 +122,42 @@ The original loop hardcoded `Device::Cpu` + `DType::F32`, upcasting BF16-on-disk
 
 For very tight VRAM, drop `--chunk-size` to 512 or 256. For maximum throughput on plentiful memory, raise it to 4096+. `--ctx-len` can be raised arbitrarily for long-document training; the cost is wall-clock, not memory.
 
+### VRAM activation arithmetic (RWKV-7 1.5B)
+
+Static cost (independent of context):
+- Weights (BF16): ~3.0 GB
+- AdamW moments on trainable subset (~3M params x 12 bytes): ~40 MB
+- State-prefix + logit adapter: negligible (~10 MB)
+
+Per-chunk activation cost dominates the variable budget:
+```
+activations_bytes  ~=  chunk_size * hidden * layers * 6
+                    =  chunk_size * 2048   * 24     * 6
+                    ~=  chunk_size * 300 KB
+```
+
+| chunk_size | activations | total (4 GB card) | total (8 GB card) |
+|-----------:|------------:|------------------:|------------------:|
+| 256        | ~75 MB      | ~3.2 GB           | fine              |
+| 512        | ~150 MB     | ~3.3 GB           | fine              |
+| 1024       | ~300 MB     | ~3.5 GB (tight)   | fine              |
+| 2048       | ~600 MB     | ~3.8 GB (risky)   | fine              |
+| 4096       | ~1.2 GB     | OOM               | ~4.4 GB           |
+
+`--ctx-len` is independent: total tokens trained per step. Cost is wall-clock only.
+
+### CUDA build
+
+```powershell
+.\build.ps1 -Cuda                              # release build with --features cuda
+.\build.ps1 -Cuda -Cudnn                       # add cudnn (needs cuDNN installed)
+.\build.ps1 -Cuda train --jsonl-from x.jsonl   # train on GPU
+```
+
+`build.ps1` auto-detects the GPU compute capability via WMI (RTX 30xx -> sm_86, RTX 40xx -> sm_89, etc.) and sets `CUDA_COMPUTE_CAP` because `nvidia-smi` fails in sandboxed shells. Override with `$env:CUDA_COMPUTE_CAP = "86"` if detection fails.
+
+Requires the CUDA Toolkit (12.x) on `$env:CUDA_PATH`. cuDNN is optional but speeds up convolutions; not load-bearing for RWKV.
+
 **Rust version**: Requires rustc 1.86+ due to candle-core `is_multiple_of` unstable feature. Use `rustup default stable && rustup update` or `rustup default nightly`.
 
 ### Host toolchain quirks on this Windows box

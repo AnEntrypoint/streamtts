@@ -19,6 +19,12 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+default = []
+cuda = ["candle-core/cuda", "sttx-core/cuda", "sttx-train/cuda"]
+cudnn = ["cuda", "candle-core/cudnn", "sttx-train/cudnn"]
+metal = ["candle-core/metal", "sttx-core/metal", "sttx-train/metal"]
+
 [dev-dependencies]
 rand = { workspace = true }
 chrono = { workspace = true }
