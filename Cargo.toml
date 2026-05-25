@@ -41,3 +41,4 @@ opt-level = 3
 
 [patch.crates-io]
 candle-core = { path = "vendor-patches/candle-core-patched" }
+candle-transformers = { path = "vendor-patches/candle-transformers-patched" }

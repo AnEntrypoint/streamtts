@@ -13,6 +13,7 @@ use sttx_core::tokenizer::{DynamicTokenizer, Hypernetwork};
 use sttx_core::trace::Trace;
 
 use crate::checkpoint::CheckpointMeta;
+use crate::loop_infer::{LoopConfig, StateSnapshot};
 use crate::model::{fresh_state, LoadedModel};
 use crate::tokens;
 
@@ -32,6 +33,9 @@ pub struct TrainConfig {
     pub checkpoint_dir: PathBuf,
     pub checkpoint_every: u64,
     pub seed: u64,
+    /// Adaptive-looping knobs (DeepConf confidence + Kalman exit gate).
+    /// `max_loops == 1` reproduces the pre-looping single-pass behavior exactly.
+    pub loop_config: LoopConfig,
 }
 
 impl Default for TrainConfig {
@@ -47,6 +51,7 @@ impl Default for TrainConfig {
             checkpoint_dir: PathBuf::from("ckpt"),
             checkpoint_every: 100,
             seed: 42,
+            loop_config: LoopConfig::default(),
         }
     }
 }
@@ -259,10 +264,51 @@ impl Trainer {
                 .broadcast_mul(&self.logit_scale)?
                 .broadcast_add(&self.logit_bias)?;
             let loss = candle_nn::loss::cross_entropy(&logits, &target_t)?;
-            let loss_step = if (scale - 1.0).abs() < f64::EPSILON {
-                loss.clone()
+
+            // Confidence-weighted looping (Ouro loop-during-training + DeepConf
+            // weights). Only active when max_loops > 1; otherwise this is a no-op
+            // and the loss below is exactly the single-pass loss (regression
+            // guard). The looped term refines the chunk's FINAL-token prediction:
+            // forward_looped re-runs the block stack on the refined hidden vector,
+            // producing distinct logits per loop even under teacher forcing. We
+            // snapshot/restore the recurrent state around the looped call so the
+            // chunk's forward chain is unaffected.
+            let combined = if self.cfg.loop_config.max_loops > 1 {
+                let final_target = *targets.last().unwrap();
+                let last_input = *input.last().unwrap();
+                let snap = StateSnapshot::capture(&state);
+                let outcome = crate::loop_infer::run_token_loops(
+                    &self.model.model,
+                    last_input,
+                    &mut state,
+                    &self.model.device,
+                    &self.cfg.loop_config,
+                )?;
+                snap.restore(&mut state);
+
+                let target_final = Tensor::new(&[final_target], &self.model.device)?;
+                let mut looped = loss.clone();
+                let mut have_term = false;
+                for (logit_i, &w) in outcome.per_loop_logits.iter().zip(outcome.weights.iter()) {
+                    let li = logit_i.unsqueeze(0)?
+                        .broadcast_mul(&self.logit_scale)?
+                        .broadcast_add(&self.logit_bias)?;
+                    let ce_i = candle_nn::loss::cross_entropy(&li, &target_final)?;
+                    let term = ce_i.affine(w as f64, 0.0)?;
+                    looped = if have_term { (looped + term)? } else { term };
+                    have_term = true;
+                }
+                // Average the base chunk loss with the confidence-weighted looped
+                // term so the bulk per-position signal is preserved.
+                ((loss.clone() + looped)?.affine(0.5, 0.0))?
             } else {
-                loss.affine(scale, 0.0)?
+                loss.clone()
+            };
+
+            let loss_step = if (scale - 1.0).abs() < f64::EPSILON {
+                combined.clone()
+            } else {
+                combined.affine(scale, 0.0)?
             };
             let loss_val = loss.to_dtype(DType::F32)?.to_vec0::<f32>()?;
             self.optimizer.backward_step(&loss_step)?;

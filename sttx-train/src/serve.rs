@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::checkpoint;
+use crate::loop_infer::{run_token_loops, LoopConfig};
 use crate::model::{self, fresh_state};
 use crate::tokens;
 use crate::train::build_state_prefix_pub;
@@ -18,10 +19,21 @@ pub struct InferenceEngine {
     model: crate::model::LoadedModel,
     state_prefix: Vec<Tensor>,
     max_tokens: usize,
+    loop_config: LoopConfig,
 }
 
 impl InferenceEngine {
     pub async fn load(checkpoint_dir: PathBuf, max_tokens: usize, device: Device, dtype: DType) -> Result<Self> {
+        Self::load_with_loops(checkpoint_dir, max_tokens, device, dtype, LoopConfig::default()).await
+    }
+
+    pub async fn load_with_loops(
+        checkpoint_dir: PathBuf,
+        max_tokens: usize,
+        device: Device,
+        dtype: DType,
+        loop_config: LoopConfig,
+    ) -> Result<Self> {
         let meta = checkpoint::load_meta(&checkpoint_dir)?;
 
         obs::info("serve", json!({"event":"loading","repo": meta.repo_id,"steps": meta.steps}));
@@ -34,9 +46,9 @@ impl InferenceEngine {
         let _ = vb;
 
         let state_prefix = build_state_prefix_pub(&loaded.config, &varmap, &loaded.device, loaded.dtype)?;
-        obs::info("serve", json!({"event":"ready","steps": meta.steps}));
+        obs::info("serve", json!({"event":"ready","steps": meta.steps,"max_loops": loop_config.max_loops}));
 
-        Ok(Self { model: loaded, state_prefix, max_tokens })
+        Ok(Self { model: loaded, state_prefix, max_tokens, loop_config })
     }
 
     pub fn generate(&self, prompt: &str) -> Result<String> {
@@ -50,17 +62,32 @@ impl InferenceEngine {
             state.per_layer[i].att_kv = prefix.clone();
         }
 
-        let logits = self.model.model.forward_seq(&ids, &mut state)?;
-        let next_id = argmax_last(&logits)?;
+        // Prefill: advance the recurrent state over the prompt, then take the
+        // prompt's final-token prediction directly (no loop on the prompt).
+        let prefill = self.model.model.forward_seq(&ids, &mut state)?;
+        let mut next_id = argmax_last(&prefill)?;
 
         let mut generated = vec![next_id];
         for _ in 1..self.max_tokens {
-            let l = self.model.model.forward_seq(&[next_id], &mut state)?;
-            let nid = argmax_last(&l)?;
+            // Each generated token gets the adaptive latent-refinement loop.
+            let outcome = run_token_loops(
+                &self.model.model,
+                next_id,
+                &mut state,
+                &self.model.device,
+                &self.loop_config,
+            )?;
+            // Use the exit (last realized) loop's logits for the actual choice.
+            let exit_logits = outcome
+                .per_loop_logits
+                .last()
+                .expect("at least one loop");
+            let nid = argmax_last(exit_logits)?;
             if nid == 0 {
                 break;
             }
             generated.push(nid);
+            next_id = nid;
         }
 
         let text = self.model.tokenizer
@@ -81,8 +108,16 @@ fn argmax_last(logits: &Tensor) -> Result<u32> {
     Ok(idx as u32)
 }
 
-pub async fn run(checkpoint: PathBuf, port: u16, max_tokens: usize, device: Device, dtype: DType) -> Result<()> {
-    let engine = Arc::new(InferenceEngine::load(checkpoint, max_tokens, device, dtype).await?);
+pub async fn run(
+    checkpoint: PathBuf,
+    port: u16,
+    max_tokens: usize,
+    device: Device,
+    dtype: DType,
+    loop_config: LoopConfig,
+) -> Result<()> {
+    let engine =
+        Arc::new(InferenceEngine::load_with_loops(checkpoint, max_tokens, device, dtype, loop_config).await?);
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     eprintln!("[serve] listening on 0.0.0.0:{port}");
     obs::info("serve", json!({"event":"listening","port": port}));

@@ -173,9 +173,83 @@ Three traps shadow the correct toolchain on this machine; `.\build.ps1` neutrali
 ```powershell
 .\build.ps1                                   # cargo build --release -p sttx-cli
 .\build.ps1 check                             # cargo check -p sttx-cli
+.\build.ps1 test                              # cargo test --lib -p sttx-core -p sttx-train
 .\build.ps1 train --ccsniff-from foo.ndjson   # cargo run --release -p sttx-cli -- train ...
-.\build.ps1 raw -- test --workspace           # any cargo invocation, defaults bypassed
+.\build.ps1 raw <cargo args...>               # any cargo invocation, defaults bypassed
 ```
+
+## Adaptive latent looping (DeepConf + Kalman + Ouro) — 2026-05-25
+
+A third scaling axis beyond model size and data: **compute per token**. Borrowed from
+three sources and combined for RWKV-7 on a 4 GB-VRAM budget:
+
+- **Ouro (Looped Language Models)** — re-feed the latent hidden vector through the
+  same weights N times before committing a token, scaling internal computation
+  without adding parameters. Helps *knowledge manipulation* (reasoning), not storage.
+- **DeepConf (Meta, arXiv 2508.15260)** — read the model's own confidence off its
+  logits instead of training an exit gate, so there is no learned gate to
+  reward-hack / collapse (the failure mode Ouro's entropy regularization fixes).
+- **Kalman filter** — the per-loop confidence signal is noisy; a 2-state
+  (confidence + velocity) constant-velocity Kalman filter denoises it and detects
+  the diminishing-returns plateau (the video's observed 3-4-loop knee).
+
+### Why it fits 4 GB VRAM
+
+Looping adds compute, not memory: RWKV-7's recurrent state is constant-size, and the
+refinement loops snapshot/restore the per-layer WKV state (`Model::forward_looped`),
+so VRAM is unchanged from a single pass. Cost is wall-clock only.
+
+### Architecture
+
+- `sttx-core/src/kalman.rs` — pure-f32 2-state Kalman filter (closed-form 2x2,
+  zero candle dep; confidence lives outside the autograd graph).
+- `sttx-train/src/loop_infer.rs` — `group_confidence` (probability-weighted top-k
+  negative-log-prob; **lower = more confident**), `LoopConfig` (serde,
+  `max_loops=1` default = baseline), `run_token_loops` (the Kalman-gated loop
+  primitive), `StateSnapshot`.
+- `vendor-patches/candle-transformers-patched` — vendored candle-transformers 0.10.2
+  with `Model::forward_looped(xs, state, token_ids, n_loops)` added to rwkv_v7.rs.
+  Loop 1 commits the real recurrent-state advance; loops 2..n snapshot the per-layer
+  WKV, re-run the block stack on the **refined hidden vector**, read logits via
+  ln_out+head, then restore — producing distinct logits per loop **even under
+  teacher forcing** (a plain forward_seq re-pass would be degenerate). Wired through
+  `[patch.crates-io]` alongside candle-core.
+- Training (`train.rs::chunked_backward_scaled`): when `max_loops>1`, the chunk's
+  final-token prediction is refined; per-loop CE (through the trainable logit
+  adapter) is confidence-weighted and averaged with the base chunk loss.
+- Inference (`serve.rs::generate`): each generated token gets the adaptive loop;
+  the exit loop's logits drive argmax.
+
+### Calibration — fitting the optimal params from small-scale tests
+
+```powershell
+.\build.ps1 raw run --release -p sttx-cli -- calibrate-loops `
+  --ccsniff-from ccsniff-fresh.ndjson --sweep-loops 8 --samples 256 `
+  --out loop-config.json --device cuda --dtype bf16
+```
+
+Sweeps loops 1..8 with **no early exit** on a held-out batch, records per-loop
+group-confidence + CE, then fits: optimal `max_loops` = knee where marginal mean-CE
+improvement drops below 1%; `conf_threshold` = mean confidence at the knee;
+`kalman_r` = variance of per-loop confidence; `kalman_q` = 0.1·r. Writes
+`loop-config.json`, which train/serve load via `--loop-config`.
+
+### Run with looping
+
+```powershell
+.\build.ps1 -Cuda train --jsonl-from data.jsonl --loop-config loop-config.json
+.\build.ps1 -Cuda train --jsonl-from data.jsonl --max-loops 4 --conf-threshold 0.3
+```
+
+`--max-loops 1` (the default) is the exact pre-looping single-pass behavior
+(regression guard, covered by unit tests).
+
+### Not applicable: DeepSeek V4 CSA/HCA and cuGraph
+
+DeepSeek V4's compressed/sparse attention (CSA/HCA) shrinks the **KV cache** —
+which RWKV-7, being an RNN, does not have. cuGraph is a graph-analytics library,
+unrelated to NN kernels. CUDA Graphs (kernel-launch capture) are not exposed by
+candle 0.10. None of these port to this architecture.
 
 ### What Happens
 

@@ -147,6 +147,11 @@ else {
     elseif ($Args[0] -eq 'check') {
         $cargoArgs = Add-FeatureFlag (@('check', '-p', 'sttx-cli') + $rest)
     }
+    elseif ($Args[0] -eq 'test') {
+        # Lib unit tests for the two crates that carry them. Hardcoded so the
+        # caller never passes bare -p flags that PowerShell would mis-bind.
+        $cargoArgs = @('test', '--lib', '-p', 'sttx-core', '-p', 'sttx-train') + $rest
+    }
     elseif ($Args[0] -in @('train', 'serve', 'inspect', 'merge-stats', 'validate-data', 'quality-assert')) {
         $cargoArgs = Add-FeatureFlag (@('run', '--release', '-p', 'sttx-cli') + @('--')) + $Args
         # Re-position --features before the `--` separator that splits cargo args from binary args.
