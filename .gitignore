@@ -1,28 +1,15 @@
 /target
 **/*.rs.bck
 Cargo.lock.bak
-.gm/log/
-.gm/exec-spool/
-.gm/last-instruction-ts
-.gm/last-prompt.txt
-.gm/mutables.yml
-.gm/next-step.md
-.gm/prd.yml
-.gm/turn-state.json
-.gm/turn-state.json.corrupted-*
-.gm/residual-check-fired
-.gm/lastskill
-.gm/rs-learn.db
-.gm/rs-learn.db-*
-.gm/*.json
-.gm/imported-claude-md-*.md
-**/.gm/log/
+# All .gm/ content is plugkit session-local state (spool, rs-learn store,
+# turn-state, markers). None of it belongs in the repo.
+.gm/
+**/.gm/
 sample.ndjson
 sample-abs.ndjson
 ckpt/
 *.safetensors
 *.bin
-.vscode/
 .idea/
 .plugkit-browser-profile/
 .plugkit-browser-profile-*/
@@ -73,3 +60,5 @@ test-data/
 train.err
 train.pid
 train.out
+config.bat
+node_modules
